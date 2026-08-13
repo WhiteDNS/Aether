@@ -68,6 +68,12 @@ pub async fn run_cli() -> Result<()> {
 
     install_netstack_panic_guard();
 
+    // Reporting modes answer a question and exit. They never open a tunnel, so
+    // they run before any of the connection setup below.
+    if let Some(command) = report_command() {
+        return run_report(command).await;
+    }
+
     let listen: SocketAddr = std::env::var("AETHER_SOCKS")
         .ok()
         .and_then(|s| s.parse().ok())
@@ -127,6 +133,93 @@ pub async fn run_cli() -> Result<()> {
             run_gool(primary, secondary, listen).await
         }
     }
+}
+
+/// A question about gateways, asked without connecting to one.
+enum ReportCommand {
+    /// Rank reachable gateways by round-trip time.
+    Scan { limit: usize },
+    /// Validate one gateway with a real authenticated handshake.
+    Test { peer: SocketAddr },
+}
+
+fn report_command() -> Option<ReportCommand> {
+    if let Ok(value) = std::env::var("AETHER_TEST_ENDPOINT") {
+        return match value.parse::<SocketAddr>() {
+            Ok(peer) => Some(ReportCommand::Test { peer }),
+            Err(_) => Some(ReportCommand::Test {
+                // Reported as a failure by run_report rather than silently
+                // falling through into a connection attempt.
+                peer: SocketAddr::from(([0, 0, 0, 0], 0)),
+            }),
+        };
+    }
+    if std::env::var("AETHER_SCAN_ONLY").is_err() {
+        return None;
+    }
+    let limit = std::env::var("AETHER_SCAN_LIMIT")
+        .ok()
+        .and_then(|value| value.parse::<usize>().ok())
+        .filter(|count| (1..=64).contains(count))
+        .unwrap_or(8);
+    Some(ReportCommand::Scan { limit })
+}
+
+/// Writes exactly one JSON object to stdout and exits successfully, whether the
+/// answer is a list of gateways or a failure. Logs go to stderr, so a caller can
+/// parse stdout without filtering it.
+async fn run_report(command: ReportCommand) -> Result<()> {
+    let config = EmbeddedConfig {
+        config_path: std::env::var("AETHER_CONFIG").unwrap_or_else(|_| DEFAULT_CONFIG.to_string()),
+        // Nothing listens in these modes; the field is required by the struct.
+        listen: SocketAddr::from(([127, 0, 0, 1], 0)),
+        peer: match command {
+            ReportCommand::Test { peer } => Some(peer),
+            ReportCommand::Scan { .. } => None,
+        },
+        peer_fallback: false,
+        scan_mode: std::env::var("AETHER_SCAN").unwrap_or_else(|_| "balanced".to_string()),
+        ip_scan: std::env::var("AETHER_IP").unwrap_or_else(|_| "v4".to_string()),
+    };
+
+    let report = match command {
+        ReportCommand::Scan { limit } => {
+            let cancelled = AtomicBool::new(false);
+            match scan_embedded(&config, limit, &cancelled).await {
+                Ok(results) => serde_json::json!({
+                    "ok": true,
+                    "results": results
+                        .iter()
+                        .map(|result| serde_json::json!({
+                            "peer": result.peer.to_string(),
+                            "rttMs": result.rtt.as_millis() as u64,
+                        }))
+                        .collect::<Vec<_>>(),
+                }),
+                Err(error) => failure(&error.to_string()),
+            }
+        }
+        // Rejected here rather than earlier so a bad address still answers in
+        // the same shape as everything else.
+        ReportCommand::Test { peer } if peer.port() == 0 => {
+            failure("the endpoint must be a numeric address and port")
+        }
+        ReportCommand::Test { .. } => match test_embedded_peer(&config).await {
+            Ok(result) => serde_json::json!({
+                "ok": true,
+                "peer": result.peer.to_string(),
+                "rttMs": result.rtt.as_millis() as u64,
+            }),
+            Err(error) => failure(&error.to_string()),
+        },
+    };
+
+    println!("{report}");
+    Ok(())
+}
+
+fn failure(message: &str) -> serde_json::Value {
+    serde_json::json!({ "ok": false, "error": message })
 }
 
 pub const fn version() -> &'static str {
