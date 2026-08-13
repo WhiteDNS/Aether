@@ -1,0 +1,72 @@
+name: build
+
+# The point of this fork is that the crate builds both ways: as a library a
+# client links, and as the command-line binary that behaves like upstream. Both
+# are built on every platform the clients ship on, so a change that only works
+# for one of them fails here rather than in a release.
+on:
+  pull_request:
+  push:
+    branches: ["**"]
+    tags: ["v*"]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: aether-${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  build:
+    name: ${{ matrix.name }}
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 60
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - os: ubuntu-latest
+            name: Linux x64
+          - os: windows-latest
+            name: Windows x64
+          - os: macos-latest
+            name: macOS arm64
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install Rust
+        uses: dtolnay/rust-toolchain@1.88.0
+        with:
+          components: clippy
+
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: aether
+
+      # BoringSSL comes in through quiche and needs cmake and a C++ compiler.
+      - name: Install build dependencies
+        if: runner.os == 'Linux'
+        run: sudo apt-get update && sudo apt-get install -y cmake build-essential
+
+      - name: Build the library
+        working-directory: aether
+        run: cargo build --locked --lib
+
+      - name: Build the command-line binary
+        working-directory: aether
+        run: cargo build --locked --bin aether
+
+      - name: Check the embedded API is actually exported
+        working-directory: aether
+        shell: bash
+        run: |
+          for symbol in prepare_embedded scan_embedded test_embedded_peer run_embedded set_socket_protector; do
+            grep -q "pub \(async \)\?fn $symbol" src/lib.rs || { echo "missing: $symbol"; exit 1; }
+          done
+          echo "all five embedded entry points present"
+
+      - name: Test
+        working-directory: aether
+        run: cargo test --locked
