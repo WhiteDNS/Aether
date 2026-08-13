@@ -14,10 +14,8 @@ use rand::Rng;
 
 const TIMER_TICK: Duration = Duration::from_millis(250);
 const MAX_PACKET: usize = 65536;
-const VERIFY_RETRY_DELAYS: [Duration; 2] = [
-    Duration::from_millis(750),
-    Duration::from_millis(2_000),
-];
+const VERIFY_RETRY_DELAYS: [Duration; 2] =
+    [Duration::from_millis(750), Duration::from_millis(2_000)];
 
 const WG_MSG_TYPE_MIN: u8 = 1;
 const WG_MSG_TYPE_MAX: u8 = 4;
@@ -117,8 +115,15 @@ impl WgTunnel {
         let peer_public = PublicKey::from(cfg.peer_public_key);
         let preshared = cfg.preshared_key;
 
-        let tunn = Tunn::new(local_secret, peer_public, preshared, cfg.persistent_keepalive, 0, None)
-            .map_err(|e| AetherError::Other(format!("wireguard tunnel init: {e}")))?;
+        let tunn = Tunn::new(
+            local_secret,
+            peer_public,
+            preshared,
+            cfg.persistent_keepalive,
+            0,
+            None,
+        )
+        .map_err(|e| AetherError::Other(format!("wireguard tunnel init: {e}")))?;
 
         Ok(Self {
             tunn: Arc::new(Mutex::new(Box::new(tunn))),
@@ -197,7 +202,8 @@ impl WgTunnel {
                                 drop(tunn);
                                 let _ = sock_r.send(&pkt_vec).await;
                             }
-                            TunnResult::WriteToTunnelV4(pkt, _) | TunnResult::WriteToTunnelV6(pkt, _) => {
+                            TunnResult::WriteToTunnelV4(pkt, _)
+                            | TunnResult::WriteToTunnelV6(pkt, _) => {
                                 *last_valid_rx_r.lock().unwrap() = Instant::now();
                                 let pkt_vec = pkt.to_vec();
                                 drop(tunn);
@@ -259,7 +265,12 @@ impl WgTunnel {
                             let sock_clone = sock_w.clone();
                             let cfg_clone = aethernoize.clone();
                             tokio::spawn(async move {
-                                aethernoize::send_post_handshake_junk(&sock_clone, peer, &cfg_clone).await;
+                                aethernoize::send_post_handshake_junk(
+                                    &sock_clone,
+                                    peer,
+                                    &cfg_clone,
+                                )
+                                .await;
                             });
                         }
                     }
@@ -305,7 +316,8 @@ impl WgTunnel {
                 if idle >= stale_timeout {
                     log::warn!(
                         "[wg] no valid data from peer {} in {:?}; tunnel considered dead",
-                        peer, idle
+                        peer,
+                        idle
                     );
                     return Err::<(), AetherError>(AetherError::Other(
                         "wireguard tunnel stale: no valid data from peer".into(),
@@ -314,7 +326,8 @@ impl WgTunnel {
 
                 let mut tunn = tunn_h.lock().await;
                 if let Err(e) =
-                    send_dataplane_probe(&sock_h, &mut tunn, &client_id_h, &probe, &mut out_buf).await
+                    send_dataplane_probe(&sock_h, &mut tunn, &client_id_h, &probe, &mut out_buf)
+                        .await
                 {
                     log::trace!("[wg] health probe send failed: {e}");
                 }
@@ -472,7 +485,8 @@ async fn verify_dataplane(
         if now >= deadline {
             log::debug!(
                 "[wg] dataplane verify timed out ({}/{} confirmations)",
-                successes, DATAPLANE_REQUIRED_SUCCESSES
+                successes,
+                DATAPLANE_REQUIRED_SUCCESSES
             );
             return Err(AetherError::Other("dataplane timeout".into()));
         }
@@ -554,9 +568,18 @@ pub async fn verify_endpoint_keep_session(
     keepalive: Option<u16>,
 ) -> Result<(Duration, EstablishedSession)> {
     let data_check = std::env::var("AETHER_WG_NO_DATA_CHECK").is_err();
-    log::trace!("[wg] verify {} obf={} data_check={}", peer, aethernoize.is_enabled(), data_check);
+    log::trace!(
+        "[wg] verify {} obf={} data_check={}",
+        peer,
+        aethernoize.is_enabled(),
+        data_check
+    );
 
-    let bind = if peer.is_ipv4() { "0.0.0.0:0" } else { "[::]:0" };
+    let bind = if peer.is_ipv4() {
+        "0.0.0.0:0"
+    } else {
+        "[::]:0"
+    };
     let sock = UdpSocket::bind(bind).await?;
     sock.connect(peer).await?;
 
@@ -570,8 +593,15 @@ pub async fn verify_endpoint_keep_session(
     let local_secret = StaticSecret::from(private_key);
     let peer_pk = PublicKey::from(peer_public);
 
-    let mut tunn = Tunn::new(local_secret, peer_pk, None, Some(keepalive.unwrap_or(25)), 0, None)
-        .map_err(|e| AetherError::Other(format!("tunn init: {e}")))?;
+    let mut tunn = Tunn::new(
+        local_secret,
+        peer_pk,
+        None,
+        Some(keepalive.unwrap_or(25)),
+        0,
+        None,
+    )
+    .map_err(|e| AetherError::Other(format!("tunn init: {e}")))?;
 
     let mut out_buf = vec![0u8; MAX_PACKET];
     let mut recv_buf = vec![0u8; MAX_PACKET];
@@ -721,10 +751,10 @@ pub const WG_ZT_PREFIXES_V4: &[&str] = &["162.159.193.0/24"];
 pub const WG_ZT_PREFIXES_V6: &[&str] = &["2606:4700:100::/48"];
 
 pub const WG_PORTS: &[u16] = &[
-    2408, 500, 1701, 4500, 854, 859, 864, 878, 880, 890, 891, 894, 903, 908, 928, 934, 939,
-    942, 943, 945, 946, 955, 968, 987, 988, 1002, 1010, 1014, 1018, 1070, 1074, 1180, 1387,
-    1843, 2371, 2506, 3138, 3476, 3581, 3854, 4177, 4198, 4233, 5279, 5956, 7103, 7152, 7156,
-    7281, 7559, 8319, 8742, 8854, 8886,
+    2408, 500, 1701, 4500, 854, 859, 864, 878, 880, 890, 891, 894, 903, 908, 928, 934, 939, 942,
+    943, 945, 946, 955, 968, 987, 988, 1002, 1010, 1014, 1018, 1070, 1074, 1180, 1387, 1843, 2371,
+    2506, 3138, 3476, 3581, 3854, 4177, 4198, 4233, 5279, 5956, 7103, 7152, 7156, 7281, 7559, 8319,
+    8742, 8854, 8886,
 ];
 
 pub const WG_SEEDS_V4: &[&str] = &[
@@ -735,7 +765,12 @@ pub const WG_SEEDS_V4: &[&str] = &[
     "162.159.193.1",
 ];
 
-pub const WG_SEEDS_V6: &[&str] = &["2606:4700:d0::a29f:c001", "2606:4700:d1::a29f:c001", "2606:4700:d0::a29f:c301", "2606:4700:d0::bc72:6001"];
+pub const WG_SEEDS_V6: &[&str] = &[
+    "2606:4700:d0::a29f:c001",
+    "2606:4700:d1::a29f:c001",
+    "2606:4700:d0::a29f:c301",
+    "2606:4700:d0::bc72:6001",
+];
 
 pub fn wg_prefixes_v4() -> Vec<&'static str> {
     crate::prober::prioritize(WG_PREFIXES_V4, WG_ZT_PREFIXES_V4)

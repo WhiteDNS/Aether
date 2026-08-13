@@ -329,7 +329,10 @@ async fn sign_in(settings: &TeamSettings) -> Result<String> {
                 "the supplied access token has expired; sign in again to get a fresh one".into(),
             ));
         }
-        log::info!("[+] using the access token supplied for team {}", settings.team);
+        log::info!(
+            "[+] using the access token supplied for team {}",
+            settings.team
+        );
         return Ok(token.clone());
     }
 
@@ -447,7 +450,10 @@ async fn fetch_token_with_email_code(settings: &TeamSettings, email: &str) -> Re
             .map_err(|e| AetherError::Api(format!("callback body: {e}")))?;
 
         if let Some(token) = extract_jwt_from_html(&body) {
-            log::info!("[+] signed in to team {} with the email code", settings.team);
+            log::info!(
+                "[+] signed in to team {} with the email code",
+                settings.team
+            );
             return Ok(token);
         }
 

@@ -184,7 +184,7 @@ impl CapsuleParser {
             CAPSULE_ADDRESS_REQUEST => Capsule::AddressRequest,
             CAPSULE_ROUTE_ADVERTISEMENT => {
                 Capsule::RouteAdvertisement(parse_route_advertisement(&value)?)
-            },
+            }
             CAPSULE_DATAGRAM => Capsule::Datagram(value),
             other => Capsule::Unknown {
                 kind: other,
@@ -386,7 +386,9 @@ mod tests {
     fn the_h3_path_still_carries_the_context_id() {
         let packet = ip_packet();
         let h3 = encode_ip_datagram(8, &packet).expect("h3 encoding");
-        let decoded = decode_ip_datagram(&h3, 8).expect("h3 decoding").expect("payload");
+        let decoded = decode_ip_datagram(&h3, 8)
+            .expect("h3 decoding")
+            .expect("payload");
         assert_eq!(decoded, packet);
     }
 }

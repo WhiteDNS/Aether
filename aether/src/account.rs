@@ -310,7 +310,10 @@ async fn fallback_call(
     let response = apifront::fetch(&request).await?;
 
     if (200..300).contains(&response.status) {
-        log::info!("[+] {label} went through the camouflaged route ({})", response.route);
+        log::info!(
+            "[+] {label} went through the camouflaged route ({})",
+            response.route
+        );
         return serde_json::from_str::<AccountData>(&response.body).map_err(|e| {
             AetherError::Api(format!(
                 "{label} decode over {}: {e}; body={}",
@@ -346,10 +349,14 @@ fn describe_rejection(status: reqwest::StatusCode, body: &str) -> String {
     });
 
     let hint = match status.as_u16() {
-        403 => " (cloudflare refused this network; the address looks flagged, \
-                try again later, switch network, or import an existing identity)",
-        429 => " (too many registrations from this address; wait a few minutes \
-                before trying again)",
+        403 => {
+            " (cloudflare refused this network; the address looks flagged, \
+                try again later, switch network, or import an existing identity)"
+        }
+        429 => {
+            " (too many registrations from this address; wait a few minutes \
+                before trying again)"
+        }
         _ => "",
     };
 
@@ -440,7 +447,10 @@ where
 fn base_headers() -> reqwest::header::HeaderMap {
     use reqwest::header::{HeaderMap, HeaderValue, CONNECTION, CONTENT_TYPE};
     let mut h = HeaderMap::new();
-    h.insert(CONTENT_TYPE, HeaderValue::from_static("application/json; charset=UTF-8"));
+    h.insert(
+        CONTENT_TYPE,
+        HeaderValue::from_static("application/json; charset=UTF-8"),
+    );
     h.insert(CONNECTION, HeaderValue::from_static("Keep-Alive"));
     h.insert(
         "CF-Client-Version",
@@ -475,7 +485,11 @@ fn tos_timestamp() -> String {
         .to_string()
 }
 
-pub async fn register(model: &str, locale: &str, jwt: Option<&str>) -> Result<(AccountData, [u8; 32])> {
+pub async fn register(
+    model: &str,
+    locale: &str,
+    jwt: Option<&str>,
+) -> Result<(AccountData, [u8; 32])> {
     let (wg_private, wg_public) = generate_x25519_keypair();
 
     let body = Registration {
@@ -512,16 +526,7 @@ pub async fn register(model: &str, locale: &str, jwt: Option<&str>) -> Result<(A
         Ok(account) => account,
         Err(primary) => {
             log::warn!("[!] registration failed over the direct route: {primary}");
-            match fallback_call(
-                "registration",
-                "POST",
-                &path,
-                Some(encoded),
-                None,
-                jwt,
-            )
-            .await
-            {
+            match fallback_call("registration", "POST", &path, Some(encoded), None, jwt).await {
                 Ok(account) => account,
                 Err(secondary) => {
                     return Err(AetherError::Api(format!(
@@ -728,7 +733,9 @@ pub async fn refresh_profile(identity: Identity) -> Identity {
         );
     }
     if !gateway_proxy.is_empty() {
-        log::debug!("[zerotrust] the organization publishes a gateway http proxy at {gateway_proxy}");
+        log::debug!(
+            "[zerotrust] the organization publishes a gateway http proxy at {gateway_proxy}"
+        );
     }
 
     Identity {
@@ -750,13 +757,22 @@ fn finish_provision(reg: AccountData, wg_private: [u8; 32]) -> Result<Identity> 
 
     let mut client_id_arr = [0u8; 3];
     if !reg.config.client_id.is_empty() {
-        log::debug!("[account] received client_id from API: {:?}", reg.config.client_id);
-        if let Ok(decoded) = base64::Engine::decode(&base64::engine::general_purpose::STANDARD, &reg.config.client_id) {
+        log::debug!(
+            "[account] received client_id from API: {:?}",
+            reg.config.client_id
+        );
+        if let Ok(decoded) = base64::Engine::decode(
+            &base64::engine::general_purpose::STANDARD,
+            &reg.config.client_id,
+        ) {
             if decoded.len() == 3 {
                 client_id_arr.copy_from_slice(&decoded);
                 log::debug!("[account] decoded client_id: {:02x?}", client_id_arr);
             } else {
-                log::warn!("[account] client_id decoded but wrong length: {}", decoded.len());
+                log::warn!(
+                    "[account] client_id decoded but wrong length: {}",
+                    decoded.len()
+                );
             }
         } else {
             log::warn!("[account] failed to decode client_id base64");
@@ -835,7 +851,14 @@ pub async fn ensure_masque_enrolled(identity: &Identity) -> Result<MasqueEnrollm
     }
 
     let keypair = generate_masque_keypair()?;
-    match enroll_key(&identity.device_id, &identity.access_token, &keypair.spki_der, None).await {
+    match enroll_key(
+        &identity.device_id,
+        &identity.access_token,
+        &keypair.spki_der,
+        None,
+    )
+    .await
+    {
         Ok(_) => {
             log::info!("[+] MASQUE key enrolled");
             Ok(MasqueEnrollment {
@@ -930,8 +953,16 @@ mod tests {
         Identity {
             device_id: "device".to_string(),
             access_token: "token".to_string(),
-            cert_pem: if with_cert { b"cert".to_vec() } else { Vec::new() },
-            key_pem: if with_cert { b"key".to_vec() } else { Vec::new() },
+            cert_pem: if with_cert {
+                b"cert".to_vec()
+            } else {
+                Vec::new()
+            },
+            key_pem: if with_cert {
+                b"key".to_vec()
+            } else {
+                Vec::new()
+            },
             cert_issued_at,
             ipv4: "172.16.0.2".to_string(),
             ipv6: String::new(),
@@ -1039,7 +1070,10 @@ mod tests {
             .await
             .expect("the camouflaged route should register a device");
 
-        println!("device={} ipv4={}", account.id, account.config.interface.addresses.v4);
+        println!(
+            "device={} ipv4={}",
+            account.id, account.config.interface.addresses.v4
+        );
         assert!(!account.id.is_empty());
         assert!(!account.token.is_empty());
         assert!(!account.config.peers.is_empty());

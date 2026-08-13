@@ -99,8 +99,13 @@ impl Device for StackDevice {
 }
 
 pub enum Cmd {
-    OpenTcp { dst: SocketAddr, resp: OpenTcpResp },
-    OpenUdp { resp: OpenUdpResp },
+    OpenTcp {
+        dst: SocketAddr,
+        resp: OpenTcpResp,
+    },
+    OpenUdp {
+        resp: OpenUdpResp,
+    },
     SetAddrs {
         v4: Option<(Ipv4Addr, u8)>,
         v6: Option<(Ipv6Addr, u8)>,
@@ -334,11 +339,7 @@ fn routable_prefix_v6(p: u8) -> u8 {
     }
 }
 
-fn apply_addrs(
-    iface: &mut Interface,
-    v4: Option<(Ipv4Addr, u8)>,
-    v6: Option<(Ipv6Addr, u8)>,
-) {
+fn apply_addrs(iface: &mut Interface, v4: Option<(Ipv4Addr, u8)>, v6: Option<(Ipv6Addr, u8)>) {
     iface.update_ip_addrs(|addrs| {
         addrs.clear();
         if let Some((ip, p)) = v4 {
@@ -565,7 +566,13 @@ fn handle_cmd(s: &mut NetStack, cmd: Cmd) {
             s.next_id += 1;
 
             let (to_app_tx, to_app_rx) = mpsc::channel(app_queue());
-            s.udp_conns.insert(id, UdpState { handle, to_app: to_app_tx });
+            s.udp_conns.insert(
+                id,
+                UdpState {
+                    handle,
+                    to_app: to_app_tx,
+                },
+            );
 
             let conn = UdpConn {
                 id,
@@ -939,7 +946,10 @@ mod tests {
             client_seq.wrapping_add(1),
             0x12,
         );
-        inbound_tx.send(syn_ack).await.expect("inbound accepts the syn-ack");
+        inbound_tx
+            .send(syn_ack)
+            .await
+            .expect("inbound accepts the syn-ack");
 
         let conn = tokio::time::timeout(StdDuration::from_secs(5), connect)
             .await
@@ -992,7 +1002,10 @@ mod tests {
         let dropped = flush_tx(&mut stack, &outbound_tx);
 
         assert!(stack.device.tx.is_empty(), "the tx queue must be drained");
-        assert_eq!(dropped, 8, "everything past the channel capacity is dropped");
+        assert_eq!(
+            dropped, 8,
+            "everything past the channel capacity is dropped"
+        );
         assert_eq!(outbound_rx.len(), 2, "the channel keeps what fits");
     }
 }

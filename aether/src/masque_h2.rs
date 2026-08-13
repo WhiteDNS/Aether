@@ -21,6 +21,32 @@ use crate::tls;
 const H2_ALPN: &[u8] = b"\x02h2";
 const CHROME_GROUPS: &str = "P-256:X25519:P-384";
 
+async fn connect_tcp(peer: SocketAddr) -> Result<TcpStream> {
+    use socket2::{Domain, Protocol, Socket, Type};
+
+    let domain = if peer.is_ipv4() {
+        Domain::IPV4
+    } else {
+        Domain::IPV6
+    };
+    let socket = Socket::new(domain, Type::STREAM, Some(Protocol::TCP)).map_err(AetherError::Io)?;
+    socket.set_nonblocking(true).map_err(AetherError::Io)?;
+    crate::socketprotect::protect(&socket)?;
+    match socket.connect(&peer.into()) {
+        Ok(()) => {}
+        Err(error)
+            if error.kind() == std::io::ErrorKind::WouldBlock
+                || error.raw_os_error() == Some(libc::EINPROGRESS) => {}
+        Err(error) => return Err(AetherError::Io(error)),
+    }
+    let stream = TcpStream::from_std(socket.into()).map_err(AetherError::Io)?;
+    stream.writable().await.map_err(AetherError::Io)?;
+    if let Some(error) = stream.take_error().map_err(AetherError::Io)? {
+        return Err(AetherError::Io(error));
+    }
+    Ok(stream)
+}
+
 struct AbortOnDrop(tokio::task::JoinHandle<()>);
 
 impl Drop for AbortOnDrop {
@@ -179,7 +205,7 @@ pub async fn verify_h2(cfg: &H2TunnelConfig, timeout: Duration) -> Result<Durati
 
     let attempt = async {
         let tls_config = build_tls(cfg)?;
-        let tcp = TcpStream::connect(cfg.peer).await.map_err(AetherError::Io)?;
+        let tcp = connect_tcp(cfg.peer).await?;
         let _ = tcp.set_nodelay(true);
         let fragment = FragmentingStream::new(tcp, FragmentConfig::from_env());
         let tls = tokio_boring::connect(tls_config, &cfg.sni, fragment)
@@ -290,33 +316,39 @@ pub async fn run(
     let tls_config = build_tls(&cfg)?;
 
     log_or_debug(quiet, format!("[h2] connecting tcp to {}", cfg.peer));
-    let tcp = TcpStream::connect(cfg.peer).await.map_err(AetherError::Io)?;
+    let tcp = connect_tcp(cfg.peer).await?;
     let _ = tcp.set_nodelay(true);
 
     let frag_cfg = FragmentConfig::from_env();
     if frag_cfg.enabled {
-        log_or_debug(quiet, format!(
-            "[h2] fragmenting client hello: size={}..{} delay={}..{}ms",
-            frag_cfg.size_min, frag_cfg.size_max, frag_cfg.delay_min_ms, frag_cfg.delay_max_ms
-        ));
+        log_or_debug(
+            quiet,
+            format!(
+                "[h2] fragmenting client hello: size={}..{} delay={}..{}ms",
+                frag_cfg.size_min, frag_cfg.size_max, frag_cfg.delay_min_ms, frag_cfg.delay_max_ms
+            ),
+        );
     }
     let fragment = FragmentingStream::new(tcp, frag_cfg);
 
     let tls = tokio_boring::connect(tls_config, &cfg.sni, fragment)
         .await
         .map_err(|e| AetherError::Tls(format!("h2 tls handshake: {e}")))?;
-    log_or_debug(quiet, format!(
-        "[h2] tls established; alpn={}",
-        String::from_utf8_lossy(tls.ssl().selected_alpn_protocol().unwrap_or(b""))
-    ));
+    log_or_debug(
+        quiet,
+        format!(
+            "[h2] tls established; alpn={}",
+            String::from_utf8_lossy(tls.ssl().selected_alpn_protocol().unwrap_or(b""))
+        ),
+    );
 
     let (h2, mut connection) = h2::client::handshake(tls)
         .await
         .map_err(|e| AetherError::Masque(format!("h2 handshake: {e}")))?;
 
-    let mut ping_pong = connection.ping_pong().ok_or_else(|| {
-        AetherError::Masque("h2 connection does not support ping".into())
-    })?;
+    let mut ping_pong = connection
+        .ping_pong()
+        .ok_or_else(|| AetherError::Masque("h2 connection does not support ping".into()))?;
 
     let driver_handle = tokio::spawn(async move {
         if let Err(e) = connection.await {
@@ -335,13 +367,19 @@ pub async fn run(
     let (resp_fut, mut send_stream) = h2
         .send_request(req, false)
         .map_err(|e| AetherError::Masque(format!("send_request: {e}")))?;
-    log_or_debug(quiet, format!("[h2] connect-ip request sent to {}", cfg.authority));
+    log_or_debug(
+        quiet,
+        format!("[h2] connect-ip request sent to {}", cfg.authority),
+    );
 
     let response = resp_fut
         .await
         .map_err(|e| AetherError::Masque(format!("await response: {e}")))?;
     let status = response.status();
-    log_or_debug(quiet, format!("[h2] connect-ip status: {}", status.as_u16()));
+    log_or_debug(
+        quiet,
+        format!("[h2] connect-ip status: {}", status.as_u16()),
+    );
     if !status.is_success() {
         return Err(AetherError::Masque(format!(
             "h2 connect-ip status {}",
@@ -359,7 +397,10 @@ pub async fn run(
             log::debug!("[h2] initial data-plane probe: {e}");
         }
         validate_deadline = Some(Instant::now() + validation_timeout());
-        log_or_debug(quiet, "[h2] validating data-plane (end-to-end probe) before exposing socks5".to_string());
+        log_or_debug(
+            quiet,
+            "[h2] validating data-plane (end-to-end probe) before exposing socks5".to_string(),
+        );
     } else if !ready_fired {
         ready_fired = true;
         if let Some(tx) = ready_tx.take() {

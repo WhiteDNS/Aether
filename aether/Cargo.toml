@@ -3,6 +3,15 @@ name = "aether"
 version = "1.5.0"
 edition = "2021"
 rust-version = "1.88"
+autobins = false
+
+[lib]
+name = "aether"
+path = "src/lib.rs"
+
+[[bin]]
+name = "aether"
+path = "src/bin/aether.rs"
 
 [dependencies]
 quiche = { path = "../quiche/quiche", default-features = false, features = ["boringssl-boring-crate", "qlog"] }

@@ -145,9 +145,7 @@ async fn handle_client(mut sock: TcpStream, stack: StackHandle, bind_ip: IpAddr)
 
     match cmd {
         CMD_CONNECT => handle_connect(sock, stack, target, port).await,
-        CMD_UDP_ASSOCIATE => {
-            handle_udp_associate(sock, stack, bind_ip, target, port).await
-        }
+        CMD_UDP_ASSOCIATE => handle_udp_associate(sock, stack, bind_ip, target, port).await,
         _ => {
             reply(&mut sock, REP_NOT_SUPPORTED).await?;
             Err(AetherError::Other("unsupported socks command".into()))
@@ -561,11 +559,7 @@ fn expected_udp_source(control_peer: SocketAddr, requested: &Target) -> IpAddr {
     }
 }
 
-fn udp_source_allowed(
-    expected_ip: IpAddr,
-    latched: Option<SocketAddr>,
-    from: SocketAddr,
-) -> bool {
+fn udp_source_allowed(expected_ip: IpAddr, latched: Option<SocketAddr>, from: SocketAddr) -> bool {
     match latched {
         Some(known) => known == from,
         None => normalize_ip(from.ip()) == normalize_ip(expected_ip),
@@ -578,24 +572,20 @@ async fn handle_direct(mut sock: TcpStream, target: Target, port: u16) -> Result
         Target::Ip(ip) => SocketAddr::new(*ip, port).to_string(),
     };
 
-    let upstream = match tokio::time::timeout(
-        Duration::from_secs(10),
-        TcpStream::connect(&address),
-    )
-    .await
-    {
-        Ok(Ok(stream)) => stream,
-        Ok(Err(error)) => {
-            log::debug!("[route] direct connect to {address} failed: {error}");
-            let _ = reply(&mut sock, REP_GENERAL).await;
-            return Ok(());
-        }
-        Err(_) => {
-            log::debug!("[route] direct connect to {address} timed out");
-            let _ = reply(&mut sock, REP_GENERAL).await;
-            return Ok(());
-        }
-    };
+    let upstream =
+        match tokio::time::timeout(Duration::from_secs(10), TcpStream::connect(&address)).await {
+            Ok(Ok(stream)) => stream,
+            Ok(Err(error)) => {
+                log::debug!("[route] direct connect to {address} failed: {error}");
+                let _ = reply(&mut sock, REP_GENERAL).await;
+                return Ok(());
+            }
+            Err(_) => {
+                log::debug!("[route] direct connect to {address} timed out");
+                let _ = reply(&mut sock, REP_GENERAL).await;
+                return Ok(());
+            }
+        };
 
     let _ = upstream.set_nodelay(true);
     reply_bound(&mut sock, "0.0.0.0:0".parse().unwrap()).await?;
@@ -630,7 +620,9 @@ async fn open_through_gateway(
 ) -> Result<GatewayChannel> {
     let conn = tokio::time::timeout(GATEWAY_PROBE_TIMEOUT, stack.open_tcp(proxy))
         .await
-        .map_err(|_| AetherError::Other(format!("gateway {proxy} did not accept a connection")))??;
+        .map_err(|_| {
+            AetherError::Other(format!("gateway {proxy} did not accept a connection"))
+        })??;
     let (sender, mut from_stack) = conn.into_split();
 
     sender.send(build_proxy_connect(authority, port)).await?;
@@ -673,7 +665,6 @@ async fn open_through_gateway(
         }
     }
 }
-
 
 async fn handle_udp_associate(
     mut sock: TcpStream,

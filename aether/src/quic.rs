@@ -21,16 +21,21 @@ fn net_queue() -> usize {
 }
 
 async fn bind_udp_fast(bind_addr: SocketAddr) -> Result<UdpSocket> {
-    use socket2::{Socket, Domain, Type};
-    let domain = if bind_addr.is_ipv4() { Domain::IPV4 } else { Domain::IPV6 };
+    use socket2::{Domain, Socket, Type};
+    let domain = if bind_addr.is_ipv4() {
+        Domain::IPV4
+    } else {
+        Domain::IPV6
+    };
     let sock = Socket::new(domain, Type::DGRAM, None).map_err(AetherError::Io)?;
     sock.set_nonblocking(true).map_err(AetherError::Io)?;
-    
+
     let buf_size = crate::sysprofile::udp_socket_buf_bytes();
     let _ = sock.set_recv_buffer_size(buf_size);
     let _ = sock.set_send_buffer_size(buf_size);
-    
+
     sock.bind(&bind_addr.into()).map_err(AetherError::Io)?;
+    crate::socketprotect::protect(&sock)?;
     UdpSocket::from_std(sock.into()).map_err(AetherError::Io)
 }
 
@@ -153,7 +158,11 @@ impl Drop for ReaderGuard {
     }
 }
 
-fn spawn_reader(sock: Arc<UdpSocket>, local: SocketAddr, tx: mpsc::Sender<NetPacket>) -> tokio::task::JoinHandle<()> {
+fn spawn_reader(
+    sock: Arc<UdpSocket>,
+    local: SocketAddr,
+    tx: mpsc::Sender<NetPacket>,
+) -> tokio::task::JoinHandle<()> {
     tokio::spawn(async move {
         let mut buf = vec![0u8; 65535];
         loop {
@@ -163,7 +172,7 @@ fn spawn_reader(sock: Arc<UdpSocket>, local: SocketAddr, tx: mpsc::Sender<NetPac
                     if tx.send((local, from, buf[..n].to_vec())).await.is_err() {
                         break;
                     }
-                },
+                }
                 Err(e) => {
                     log::debug!("recv error: {e}");
                     break;
@@ -260,7 +269,7 @@ pub async fn run(
 
         tokio::select! {
             biased;
-            
+
             _ = keepalive_interval.tick() => {
                 if conn.is_established() {
                     if let Err(e) = conn.send_ack_eliciting() {
@@ -339,10 +348,13 @@ pub async fn run(
 
         if conn.is_established() && h3_conn.is_none() {
             established_ever = true;
-            log_or_debug(quiet, format!(
-                "quic handshake established; alpn={}",
-                String::from_utf8_lossy(conn.application_proto())
-            ));
+            log_or_debug(
+                quiet,
+                format!(
+                    "quic handshake established; alpn={}",
+                    String::from_utf8_lossy(conn.application_proto())
+                ),
+            );
             let mut h3c = h3::Connection::with_transport(&mut conn, &h3_config)?;
             let headers = masque::connect_ip_request(&cfg.authority, &cfg.path);
             let sid = h3c.send_request(&mut conn, &headers, false)?;
@@ -352,7 +364,10 @@ pub async fn run(
 
             if data_check {
                 validate_deadline = Some(Instant::now() + validation_timeout());
-                log_or_debug(quiet, "[*] validating masque data-plane before exposing socks5".to_string());
+                log_or_debug(
+                    quiet,
+                    "[*] validating masque data-plane before exposing socks5".to_string(),
+                );
             } else if !ready_fired {
                 ready_fired = true;
                 if let Some(tx) = ready_tx.take() {
@@ -365,14 +380,14 @@ pub async fn run(
             poll_h3(&mut conn, h3c, sid, &mut capsules, &addr_tx, quiet)?;
         }
 
-        let got_data =
-            drain_datagrams(&mut conn, req_stream, &internals.inbound_tx, &mut out_buf);
+        let got_data = drain_datagrams(&mut conn, req_stream, &internals.inbound_tx, &mut out_buf);
 
         if got_data && !ready_fired {
             validate_successes += 1;
             log::debug!(
                 "[*] masque data-plane round-trip {}/{} confirmed",
-                validate_successes, DATA_PROBE_REQUIRED_SUCCESSES
+                validate_successes,
+                DATA_PROBE_REQUIRED_SUCCESSES
             );
             if validate_successes >= DATA_PROBE_REQUIRED_SUCCESSES {
                 ready_fired = true;
@@ -380,7 +395,11 @@ pub async fn run(
                 if let Some(tx) = ready_tx.take() {
                     let _ = tx.send(());
                 }
-                log_or_debug(quiet, "[+] masque tunnel validated (end-to-end data confirmed); exposing socks5".to_string());
+                log_or_debug(
+                    quiet,
+                    "[+] masque tunnel validated (end-to-end data confirmed); exposing socks5"
+                        .to_string(),
+                );
             }
         }
 
@@ -413,20 +432,26 @@ pub async fn run(
 
             log_or_debug(quiet, format!("connection closed: {:?}", conn.stats()));
             if let Some(e) = conn.peer_error() {
-                log_or_debug(quiet, format!(
-                    "peer closed: code=0x{:x} app={} reason={}",
-                    e.error_code,
-                    e.is_app,
-                    String::from_utf8_lossy(&e.reason)
-                ));
+                log_or_debug(
+                    quiet,
+                    format!(
+                        "peer closed: code=0x{:x} app={} reason={}",
+                        e.error_code,
+                        e.is_app,
+                        String::from_utf8_lossy(&e.reason)
+                    ),
+                );
             }
             if let Some(e) = conn.local_error() {
-                log_or_debug(quiet, format!(
-                    "local closed: code=0x{:x} app={} reason={}",
-                    e.error_code,
-                    e.is_app,
-                    String::from_utf8_lossy(&e.reason)
-                ));
+                log_or_debug(
+                    quiet,
+                    format!(
+                        "local closed: code=0x{:x} app={} reason={}",
+                        e.error_code,
+                        e.is_app,
+                        String::from_utf8_lossy(&e.reason)
+                    ),
+                );
             }
             return Ok(());
         }
@@ -463,7 +488,10 @@ fn poll_h3(
             Ok((_stream_id, h3::Event::Headers { list, .. })) => {
                 for h in &list {
                     if h.name() == b":status" {
-                        log_or_debug(quiet, format!("connect-ip status: {}", String::from_utf8_lossy(h.value())));
+                        log_or_debug(
+                            quiet,
+                            format!("connect-ip status: {}", String::from_utf8_lossy(h.value())),
+                        );
                     }
                 }
             }
@@ -524,9 +552,7 @@ fn drain_capsules(capsules: &mut CapsuleParser, addr_tx: &Option<mpsc::Sender<As
 
 fn bytes_to_ip(version: u8, bytes: &[u8]) -> Option<IpAddr> {
     match version {
-        4 if bytes.len() == 4 => {
-            Some(IpAddr::V4([bytes[0], bytes[1], bytes[2], bytes[3]].into()))
-        }
+        4 if bytes.len() == 4 => Some(IpAddr::V4([bytes[0], bytes[1], bytes[2], bytes[3]].into())),
         6 if bytes.len() == 16 => {
             let mut b = [0u8; 16];
             b.copy_from_slice(bytes);
@@ -649,7 +675,11 @@ pub struct VerifyParams {
 }
 
 pub async fn verify_masque(p: &VerifyParams) -> Result<Duration> {
-    let bind: SocketAddr = if p.peer.is_ipv4() { "0.0.0.0:0".parse().unwrap() } else { "[::]:0".parse().unwrap() };
+    let bind: SocketAddr = if p.peer.is_ipv4() {
+        "0.0.0.0:0".parse().unwrap()
+    } else {
+        "[::]:0".parse().unwrap()
+    };
     let sock = bind_udp_fast(bind).await?;
     sock.connect(p.peer).await?;
     let local = sock.local_addr()?;
@@ -803,7 +833,9 @@ pub async fn verify_masque(p: &VerifyParams) -> Result<Duration> {
         flush_connected(&mut conn, &sock).await?;
 
         if conn.is_closed() {
-            return Err(AetherError::Other("closed before data-plane confirmation".into()));
+            return Err(AetherError::Other(
+                "closed before data-plane confirmation".into(),
+            ));
         }
     }
 }
