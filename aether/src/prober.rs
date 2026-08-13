@@ -398,6 +398,12 @@ pub async fn scan_gateways(
 ) -> Result<Vec<ProbeResult>> {
     let mut st = mode.strategy();
     st.concurrency = crate::sysprofile::cap_concurrency(st.concurrency);
+    // Turbo's zero quiet window means "stop at the first working gateway", which
+    // is what connecting wants and the opposite of what a scan is for: it
+    // returned exactly one result however many were asked for.
+    if st.quiet_after_first.is_zero() {
+        st.quiet_after_first = Duration::from_secs(8);
+    }
     let timeout = st.per_probe_timeout;
     let mut effective_ip = probe.ip;
     if probe.ip.want_v6() && !host_has_ipv6().await {
@@ -407,7 +413,7 @@ pub async fn scan_gateways(
             return Err(AetherError::NoCleanEndpoint);
         }
     }
-    let candidates = build_candidates(&st, &probe.ports, effective_ip);
+    let candidates = spread_seeds(build_candidates(&st, &probe.ports, effective_ip));
     let ironclad = mode == ScanMode::Ironclad;
     let stream = futures::stream::iter(
         candidates
@@ -446,9 +452,6 @@ pub async fn scan_gateways(
                             if results.len() >= limit {
                                 break;
                             }
-                        }
-                        if st.quiet_after_first.is_zero() {
-                            break;
                         }
                         quiet_until = Some(Instant::now() + st.quiet_after_first);
                     }
@@ -548,6 +551,50 @@ async fn verify_one(
             log::trace!("probe {ip}:{port} -> {e}");
             None
         }
+    }
+}
+
+/// One seed for every this many sampled addresses, when scanning.
+const SEED_SPACING: usize = 3;
+
+/// Spreads the fixed seed gateways through the sampled ones.
+///
+/// `build_candidates` puts the seeds first, which is right for connecting: they
+/// are the shortest path to a working tunnel. It is wrong for scanning. The seed
+/// list is eight addresses and a scan asks for eight results, so on any network
+/// where the seeds answer the list fills with them and no sampled address is
+/// ever reached — which is why every search depth returned the same handful.
+///
+/// The seeds are kept, just not allowed to monopolise the first wave.
+fn spread_seeds(candidates: Vec<(IpAddr, u16)>) -> Vec<(IpAddr, u16)> {
+    let seed_count = candidates
+        .iter()
+        .take_while(|(address, _)| is_seed(address))
+        .count();
+    if seed_count == 0 || candidates.len() <= seed_count {
+        return candidates;
+    }
+
+    let (seeds, sampled) = candidates.split_at(seed_count);
+    let mut seeds = seeds.iter();
+    let mut out = Vec::with_capacity(candidates.len());
+    for (index, entry) in sampled.iter().enumerate() {
+        if index % SEED_SPACING == SEED_SPACING - 1 {
+            if let Some(seed) = seeds.next() {
+                out.push(*seed);
+            }
+        }
+        out.push(*entry);
+    }
+    // Any seeds left over when the sampled list is short still get probed.
+    out.extend(seeds);
+    out
+}
+
+fn is_seed(address: &IpAddr) -> bool {
+    match address {
+        IpAddr::V4(v4) => MASQUE_SEEDS.iter().any(|seed| seed.parse() == Ok(*v4)),
+        IpAddr::V6(v6) => MASQUE_SEEDS_V6.iter().any(|seed| seed.parse() == Ok(*v6)),
     }
 }
 
@@ -758,6 +805,52 @@ fn sample_cidr_v6(cidr: &str, n: usize, v4_cidrs: &[&str]) -> Vec<Ipv6Addr> {
 
 #[cfg(test)]
 mod tests {
+    fn v4(address: &str) -> IpAddr {
+        IpAddr::V4(address.parse().unwrap())
+    }
+
+    #[test]
+    fn scanning_does_not_let_the_seeds_fill_the_whole_result_list() {
+        // The eight seeds are as long as the result limit a scan asks for, so
+        // front-loaded they answer first, fill the list, and no sampled address
+        // is ever reached -- every search depth then returns the same handful.
+        let mut candidates: Vec<(IpAddr, u16)> =
+            MASQUE_SEEDS.iter().map(|s| (v4(s), 443)).collect();
+        for octet in 1..=40 {
+            candidates.push((v4(&format!("104.17.0.{octet}")), 443));
+        }
+
+        let spread = spread_seeds(candidates.clone());
+        assert_eq!(spread.len(), candidates.len(), "nothing may be dropped");
+
+        let first_eight = &spread[..8];
+        let seeds_up_front = first_eight.iter().filter(|(a, _)| is_seed(a)).count();
+        assert!(
+            seeds_up_front < MASQUE_SEEDS.len(),
+            "seeds still monopolise the first wave: {seeds_up_front} of 8",
+        );
+        assert!(seeds_up_front > 0, "seeds are known-good and must still be probed early");
+    }
+
+    #[test]
+    fn every_seed_is_still_probed() {
+        let mut candidates: Vec<(IpAddr, u16)> =
+            MASQUE_SEEDS.iter().map(|s| (v4(s), 443)).collect();
+        candidates.push((v4("104.17.0.1"), 443));
+        let spread = spread_seeds(candidates);
+        let seeds = spread.iter().filter(|(a, _)| is_seed(a)).count();
+        // A short sampled list must not strand the seeds that did not fit
+        // between its entries.
+        assert_eq!(seeds, MASQUE_SEEDS.len());
+    }
+
+    #[test]
+    fn a_list_with_no_sampled_addresses_is_returned_unchanged() {
+        let candidates: Vec<(IpAddr, u16)> =
+            MASQUE_SEEDS.iter().map(|s| (v4(s), 443)).collect();
+        assert_eq!(spread_seeds(candidates.clone()), candidates);
+    }
+
     use super::*;
 
     #[test]
