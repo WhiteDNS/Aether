@@ -1,6 +1,9 @@
 use std::collections::HashSet;
 use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr};
-use std::sync::Arc;
+use std::sync::{
+    atomic::{AtomicBool, Ordering},
+    Arc,
+};
 use std::time::{Duration, Instant};
 
 use futures::stream::StreamExt;
@@ -29,6 +32,31 @@ pub const MASQUE_CIDRS_V4: &[&str] = &[
     "188.114.99.0/24",
     "162.159.36.0/24",
     "162.159.46.0/24",
+];
+
+/// The dedicated WARP ranges above are where an endpoint is most likely to be,
+/// but they are not the only place one lives: Cloudflare anycasts the MASQUE
+/// endpoint across its edge, and 104.25.202.52 -- squarely in the CDN range and
+/// in none of the ranges above -- was confirmed working from an Iranian network
+/// the scan had reported as empty. These are searched after the dedicated
+/// ranges, on 443 only, since that is the port the edge serves.
+pub const MASQUE_CDN_CIDRS_V4: &[&str] = &[
+    "104.16.0.0/16",
+    "104.17.0.0/16",
+    "104.18.0.0/16",
+    "104.19.0.0/16",
+    "104.24.0.0/16",
+    "104.25.0.0/16",
+    "104.26.0.0/16",
+    "104.27.0.0/16",
+    "172.64.0.0/16",
+    "172.66.0.0/16",
+    "172.67.0.0/16",
+    "103.21.244.0/22",
+    "103.22.200.0/22",
+    "141.101.64.0/18",
+    "190.93.240.0/20",
+    "198.41.128.0/17",
 ];
 
 pub const MASQUE_SEEDS: &[&str] = &[
@@ -361,6 +389,142 @@ pub async fn hunt_best_gateway(probe: &MasqueProbe, mode: ScanMode) -> Result<Pr
     }
 }
 
+/// Ranks reachable gateways instead of stopping at the first one.
+///
+/// [`hunt_best_gateway`] answers "what should I connect to"; this answers "what
+/// is out there", which is a different question and needs a different shape:
+/// several results, a cap on how many, and a way to give up half way when the
+/// person who asked has moved on.
+pub async fn scan_gateways(
+    probe: &MasqueProbe,
+    mode: ScanMode,
+    limit: usize,
+    cancelled: &AtomicBool,
+) -> Result<Vec<ProbeResult>> {
+    let mut st = mode.strategy();
+    st.concurrency = crate::sysprofile::cap_concurrency(st.concurrency);
+    // Turbo's zero quiet window means "stop at the first working gateway", which
+    // is what connecting wants and the opposite of what a scan is for: it
+    // returned exactly one result however many were asked for.
+    if st.quiet_after_first.is_zero() {
+        st.quiet_after_first = Duration::from_secs(8);
+    }
+    let timeout = st.per_probe_timeout;
+    let mut effective_ip = probe.ip;
+    if probe.ip.want_v6() && !host_has_ipv6().await {
+        if probe.ip.want_v4() {
+            effective_ip = IpScan::V4;
+        } else {
+            return Err(AetherError::NoCleanEndpoint);
+        }
+    }
+    let candidates = spread_seeds(build_candidates(&st, &probe.ports, effective_ip));
+    let ironclad = mode == ScanMode::Ironclad;
+    let stream = futures::stream::iter(
+        candidates
+            .into_iter()
+            .map(|(ip, port)| verify_one(probe, ip, port, timeout, ironclad)),
+    )
+    .buffer_unordered(st.concurrency);
+    tokio::pin!(stream);
+
+    let limit = limit.clamp(1, 16);
+    let deadline = Instant::now() + st.overall_deadline;
+    let mut quiet_until: Option<Instant> = None;
+    let mut results: Vec<ProbeResult> = Vec::new();
+
+    loop {
+        if cancelled.load(Ordering::Relaxed) {
+            return Err(AetherError::Other("endpoint scan cancelled".into()));
+        }
+        let effective = quiet_until.map_or(deadline, |quiet| quiet.min(deadline));
+        let remaining = effective.saturating_duration_since(Instant::now());
+        if remaining.is_zero() {
+            break;
+        }
+
+        tokio::select! {
+            item = stream.next() => {
+                match item {
+                    None => break,
+                    Some(None) => continue,
+                    Some(Some(result)) => {
+                        if !results
+                            .iter()
+                            .any(|existing| existing.ip == result.ip && existing.port == result.port)
+                        {
+                            results.push(result);
+                            results.sort_by_key(|entry| entry.rtt);
+                            if results.len() >= limit {
+                                break;
+                            }
+                        }
+                        quiet_until = Some(Instant::now() + st.quiet_after_first);
+                    }
+                }
+            }
+            _ = tokio::time::sleep(remaining) => break,
+            // Wakes the loop often enough that a cancellation is noticed while
+            // the probes are still running, rather than at the deadline.
+            _ = tokio::time::sleep(Duration::from_millis(100)) => {}
+        }
+    }
+
+    if cancelled.load(Ordering::Relaxed) {
+        return Err(AetherError::Other("endpoint scan cancelled".into()));
+    }
+    if results.is_empty() {
+        Err(AetherError::NoCleanEndpoint)
+    } else {
+        Ok(results)
+    }
+}
+
+/// One seed for every this many sampled addresses, when scanning.
+const SEED_SPACING: usize = 3;
+
+/// Spreads the fixed seed gateways through the sampled ones.
+///
+/// [`build_candidates`] puts the seeds first, which is right for connecting:
+/// they are the shortest path to a working tunnel. It is wrong for scanning.
+/// The seed list is eight addresses and a scan asks for eight results, so on any
+/// network where the seeds answer the list fills with them and no sampled
+/// address is ever reached -- which is why every search depth returned the same
+/// handful.
+///
+/// The seeds are kept, just not allowed to monopolise the first wave.
+fn spread_seeds(candidates: Vec<(IpAddr, u16)>) -> Vec<(IpAddr, u16)> {
+    let seed_count = candidates
+        .iter()
+        .take_while(|(address, _)| is_seed(address))
+        .count();
+    if seed_count == 0 || candidates.len() <= seed_count {
+        return candidates;
+    }
+
+    let (seeds, sampled) = candidates.split_at(seed_count);
+    let mut seeds = seeds.iter();
+    let mut out = Vec::with_capacity(candidates.len());
+    for (index, entry) in sampled.iter().enumerate() {
+        if index % SEED_SPACING == SEED_SPACING - 1 {
+            if let Some(seed) = seeds.next() {
+                out.push(*seed);
+            }
+        }
+        out.push(*entry);
+    }
+    // Any seeds left over when the sampled list is short still get probed.
+    out.extend(seeds);
+    out
+}
+
+fn is_seed(address: &IpAddr) -> bool {
+    match address {
+        IpAddr::V4(v4) => MASQUE_SEEDS.iter().any(|seed| seed.parse() == Ok(*v4)),
+        IpAddr::V6(v6) => MASQUE_SEEDS_V6.iter().any(|seed| seed.parse() == Ok(*v6)),
+    }
+}
+
 async fn verify_one(
     probe: &MasqueProbe,
     ip: IpAddr,
@@ -467,6 +631,28 @@ fn build_candidates(st: &Strategy, ports: &[u16], ip: IpScan) -> Vec<(IpAddr, u1
                 if let Some(a) = hosts.get(i) {
                     if seen.insert((IpAddr::V4(*a), primary)) {
                         out.push((IpAddr::V4(*a), primary));
+                    }
+                }
+            }
+        }
+
+        // Edge ranges last, so a network where the dedicated ranges answer is
+        // unaffected and only one that finds nothing there pays for the wider
+        // sweep. Sampled more thinly, because they are far larger and a smaller
+        // share of them terminates MASQUE.
+        if st.sample_per_cidr > 0 {
+            let per = (st.sample_per_cidr / 4).max(8);
+            let cdn: Vec<Vec<Ipv4Addr>> = MASQUE_CDN_CIDRS_V4
+                .iter()
+                .map(|c| sample_cidr_v4(c, per))
+                .collect();
+            let cdn_max = cdn.iter().map(|v| v.len()).max().unwrap_or(0);
+            for i in 0..cdn_max {
+                for hosts in &cdn {
+                    if let Some(a) = hosts.get(i) {
+                        if seen.insert((IpAddr::V4(*a), 443)) {
+                            out.push((IpAddr::V4(*a), 443));
+                        }
                     }
                 }
             }
@@ -606,6 +792,61 @@ fn sample_cidr_v6(cidr: &str, n: usize, v4_cidrs: &[&str]) -> Vec<Ipv6Addr> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn v4(address: &str) -> IpAddr {
+        IpAddr::V4(address.parse().unwrap())
+    }
+
+    #[test]
+    fn scanning_does_not_let_the_seeds_fill_the_whole_result_list() {
+        // The seeds are as long as the result limit a scan asks for, so
+        // front-loaded they answer first, fill the list, and no sampled address
+        // is ever reached -- every search depth then returns the same handful.
+        let mut candidates: Vec<(IpAddr, u16)> =
+            MASQUE_SEEDS.iter().map(|s| (v4(s), 443)).collect();
+        for octet in 1..=40 {
+            candidates.push((v4(&format!("104.17.0.{octet}")), 443));
+        }
+
+        let spread = spread_seeds(candidates.clone());
+        assert_eq!(spread.len(), candidates.len(), "nothing may be dropped");
+
+        let first_wave = &spread[..MASQUE_SEEDS.len()];
+        let seeds_up_front = first_wave.iter().filter(|(a, _)| is_seed(a)).count();
+        assert!(
+            seeds_up_front < MASQUE_SEEDS.len(),
+            "seeds still monopolise the first wave: {seeds_up_front}",
+        );
+        assert!(
+            seeds_up_front > 0,
+            "seeds are known-good and must still be probed early",
+        );
+    }
+
+    #[test]
+    fn every_seed_is_still_probed() {
+        let mut candidates: Vec<(IpAddr, u16)> =
+            MASQUE_SEEDS.iter().map(|s| (v4(s), 443)).collect();
+        candidates.push((v4("104.17.0.1"), 443));
+        let spread = spread_seeds(candidates);
+        let seeds = spread.iter().filter(|(a, _)| is_seed(a)).count();
+        // A short sampled list must not strand the seeds that did not fit
+        // between its entries.
+        assert_eq!(seeds, MASQUE_SEEDS.len());
+    }
+
+    #[test]
+    fn a_list_with_no_sampled_addresses_is_returned_unchanged() {
+        let candidates: Vec<(IpAddr, u16)> = MASQUE_SEEDS.iter().map(|s| (v4(s), 443)).collect();
+        assert_eq!(spread_seeds(candidates.clone()), candidates);
+    }
+
+    #[test]
+    fn the_edge_ranges_are_searched_as_well_as_the_dedicated_ones() {
+        // An address in 104.25 was confirmed working from a network where the
+        // dedicated ranges answered nothing at all.
+        assert!(MASQUE_CDN_CIDRS_V4.contains(&"104.25.0.0/16"));
+    }
 
     #[test]
     fn the_documented_zero_trust_masque_ingress_range_is_scanned() {
