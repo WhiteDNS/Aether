@@ -71,6 +71,12 @@ pub async fn run_with(args: Vec<String>) -> Result<()> {
 
     install_netstack_panic_guard();
 
+    // Reporting modes answer a question and exit. They never open a tunnel, so
+    // they run before any of the connection setup below.
+    if let Some(command) = report_command() {
+        return run_report(command).await;
+    }
+
     let listen: SocketAddr = std::env::var("AETHER_SOCKS")
         .ok()
         .and_then(|s| s.parse().ok())
@@ -665,6 +671,100 @@ fn masque_startup_timeout() -> std::time::Duration {
         .filter(|&v| v > 0)
         .unwrap_or(30);
     std::time::Duration::from_secs(secs)
+}
+
+/// A question about gateways, asked without connecting to one.
+///
+/// A client that only spawns the binary can start a tunnel and read the log,
+/// but it cannot offer an endpoint picker: there is no way to ask which
+/// gateways are reachable, how fast each one is, or whether one specific
+/// address works, short of committing to a connection and watching what
+/// happens.
+enum ReportCommand {
+    /// Rank reachable gateways by round-trip time.
+    Scan { limit: usize },
+    /// Validate one gateway with a real authenticated handshake.
+    Test { peer: Option<SocketAddr> },
+}
+
+fn report_command() -> Option<ReportCommand> {
+    if let Ok(value) = std::env::var("AETHER_TEST_ENDPOINT") {
+        // A bad address is still answered in the reporting shape rather than
+        // falling through into a connection attempt.
+        return Some(ReportCommand::Test {
+            peer: value.parse::<SocketAddr>().ok(),
+        });
+    }
+    if std::env::var("AETHER_SCAN_ONLY").is_err() {
+        return None;
+    }
+    let limit = std::env::var("AETHER_SCAN_LIMIT")
+        .ok()
+        .and_then(|value| value.parse::<usize>().ok())
+        .filter(|count| (1..=16).contains(count))
+        .unwrap_or(8);
+    Some(ReportCommand::Scan { limit })
+}
+
+/// Writes exactly one JSON object to stdout and exits successfully, whether the
+/// answer is a list of gateways or a failure. Logs go to stderr, so a caller can
+/// parse stdout without filtering it.
+async fn run_report(command: ReportCommand) -> Result<()> {
+    let report = match report_answer(command).await {
+        Ok(value) => value,
+        Err(error) => serde_json::json!({"ok": false, "error": error.to_string()}),
+    };
+    println!("{report}");
+    Ok(())
+}
+
+async fn report_answer(command: ReportCommand) -> Result<serde_json::Value> {
+    let base_config = std::env::var("AETHER_CONFIG").unwrap_or_else(|_| DEFAULT_CONFIG.to_string());
+    let config_path = masque_config_path(&base_config);
+    let identity = load_or_provision_masque(&config_path).await?;
+
+    match command {
+        ReportCommand::Scan { limit } => {
+            let request = api::ScanRequest::for_transport(api::Transport::Masque)
+                .with_mode(&std::env::var("AETHER_SCAN").unwrap_or_else(|_| "balanced".into()))
+                .with_ip(prober::IpScan::parse(
+                    &std::env::var("AETHER_IP").unwrap_or_else(|_| "v4".into()),
+                ))
+                .with_profile(
+                    &std::env::var("AETHER_NOIZE").unwrap_or_else(|_| "firewall".into()),
+                );
+            let found = api::scan_ranked(&identity, &request, limit, &api::Cancel::new()).await?;
+            Ok(serde_json::json!({
+                "ok": true,
+                "results": found
+                    .iter()
+                    .map(|endpoint| serde_json::json!({
+                        "peer": endpoint.socket().to_string(),
+                        "rttMs": endpoint.rtt_ms,
+                    }))
+                    .collect::<Vec<_>>(),
+            }))
+        }
+        ReportCommand::Test { peer: None } => Err(AetherError::Other(
+            "the endpoint must be a numeric address and port".into(),
+        )),
+        ReportCommand::Test { peer: Some(peer) } => {
+            // Timed here rather than inside the verifier: what the caller is
+            // being told is how long a real authenticated handshake took, which
+            // is the only number that means anything for this address.
+            let started = Instant::now();
+            if !quick_verify_masque_peer(&identity, peer).await {
+                return Err(AetherError::Other(format!(
+                    "{peer} did not answer a MASQUE handshake"
+                )));
+            }
+            Ok(serde_json::json!({
+                "ok": true,
+                "peer": peer.to_string(),
+                "rttMs": started.elapsed().as_millis() as u64,
+            }))
+        }
+    }
 }
 
 async fn hunt_masque_peer(
