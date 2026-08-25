@@ -44,6 +44,20 @@ fn parse_local_v4(s: &str) -> Ipv4Addr {
 }
 
 const TUNNEL_MTU: usize = 1280;
+/// The inner MTU for WireGuard, which has room the MASQUE path does not.
+///
+/// MASQUE is capped by what Cloudflare carries in one connect-ip capsule --
+/// 1306 bytes of inner packet, measured on a live connection -- so 1280 is
+/// already at that ceiling. WireGuard is capped by the path instead: its own
+/// overhead is 32 bytes and the outer UDP and IP headers another 28, so an
+/// inner packet of 1340 leaves here as a 1400-byte datagram, which any ordinary
+/// network carries.
+///
+/// Those 60 bytes decide one thing in particular. A QUIC handshake opens with a
+/// 1280-byte datagram, which is 1308 bytes of IP packet: at an inner MTU of
+/// 1280 it does not fit, so every hysteria2 or tuic node behind the tunnel
+/// fails before it starts. At 1340 it fits.
+const WIREGUARD_MTU: usize = 1340;
 const INNER_MTU: usize = 1200;
 const DEFAULT_CONFIG: &str = "aether.toml";
 
@@ -1450,7 +1464,7 @@ async fn run_wireguard_tunnel(
 
     let tunnel = wireguard::WgTunnel::from_established(session, std::sync::Arc::new(aethernoize), inbound_tx, ipv4);
 
-    let stack = netstack::spawn(&identity.ipv4, &identity.ipv6, TUNNEL_MTU, inbound_rx, outbound_tx)?;
+    let stack = netstack::spawn(&identity.ipv4, &identity.ipv6, WIREGUARD_MTU, inbound_rx, outbound_tx)?;
 
     let mut tasks = TaskGuard::new();
 
