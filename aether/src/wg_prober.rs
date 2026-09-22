@@ -1,5 +1,6 @@
 use std::collections::HashSet;
 use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr};
+use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
@@ -10,6 +11,105 @@ use crate::aethernoize::AetherNoizeConfig;
 use crate::error::{AetherError, Result};
 use crate::prober::IpScan;
 use crate::wireguard;
+
+/// Why probes failed, counted rather than logged one at a time.
+///
+/// A scan makes thousands of attempts, so logging each is unusable -- but the
+/// distribution of failures is the entire diagnosis. Every probe timing out
+/// means packets left the device and nothing came back, which is a blocked or
+/// filtered path. Every probe failing to send means they never left at all,
+/// which is this device's own routing. Those have opposite fixes, and until now
+/// the log collapsed both into "no clean endpoint found".
+#[derive(Default)]
+pub struct ProbeTally {
+    /// Sent, and nothing ever came back.
+    silent: AtomicUsize,
+    /// The socket could not send: no route, or the OS refused.
+    unreachable: AtomicUsize,
+    /// Android declined to protect the socket, so it would have gone into the
+    /// tunnel we are trying to replace.
+    unprotected: AtomicUsize,
+    /// Something answered, but the handshake or the data check did not finish.
+    rejected: AtomicUsize,
+    other: AtomicUsize,
+}
+
+impl ProbeTally {
+    fn record(&self, error: &AetherError) {
+        let counter = match error {
+            AetherError::Other(message) if message.contains("rejected upstream socket") => {
+                &self.unprotected
+            }
+            AetherError::Other(message) if message.contains("verify timeout") => &self.silent,
+            AetherError::Io(io) => match io.kind() {
+                std::io::ErrorKind::NetworkUnreachable
+                | std::io::ErrorKind::HostUnreachable
+                | std::io::ErrorKind::AddrNotAvailable
+                | std::io::ErrorKind::PermissionDenied => &self.unreachable,
+                std::io::ErrorKind::TimedOut | std::io::ErrorKind::WouldBlock => &self.silent,
+                _ => &self.other,
+            },
+            _ => &self.other,
+        };
+        counter.fetch_add(1, Ordering::Relaxed);
+    }
+
+    fn reset(&self) {
+        for counter in self.all() {
+            counter.store(0, Ordering::Relaxed);
+        }
+    }
+
+    fn all(&self) -> [&AtomicUsize; 5] {
+        [
+            &self.silent,
+            &self.unreachable,
+            &self.unprotected,
+            &self.rejected,
+            &self.other,
+        ]
+    }
+
+    fn describe(&self) -> String {
+        let read = |counter: &AtomicUsize| counter.load(Ordering::Relaxed);
+        format!(
+            "no reply={} could not send={} refused by vpn={} handshake refused={} \
+             other={} opened with no protector={}",
+            read(&self.silent),
+            read(&self.unreachable),
+            read(&self.unprotected),
+            read(&self.rejected),
+            read(&self.other),
+            crate::socketprotect::unprotected_count(),
+        )
+    }
+}
+
+/// Shared because probes run on many tasks and the classes matter, not which
+/// address produced which. Passes are sequential, so one tally is enough.
+pub static PROBE_TALLY: ProbeTally = ProbeTally {
+    silent: AtomicUsize::new(0),
+    unreachable: AtomicUsize::new(0),
+    unprotected: AtomicUsize::new(0),
+    rejected: AtomicUsize::new(0),
+    other: AtomicUsize::new(0),
+};
+
+/// Forgets the previous pass, so a summary describes only the one just run.
+pub fn begin_probe_pass() {
+    PROBE_TALLY.reset();
+    crate::socketprotect::reset_unprotected_count();
+}
+
+/// One line saying how the pass failed, for the diagnostics report.
+pub fn probe_pass_summary() -> String {
+    PROBE_TALLY.describe()
+}
+
+/// Counts a failure that happened outside `verify_one_wg`.
+pub fn record_probe_failure(error: &AetherError) {
+    PROBE_TALLY.record(error);
+}
 
 #[derive(Debug, Clone, Copy)]
 pub struct WgProbeResult {
@@ -48,10 +148,19 @@ impl WgScanMode {
         }
     }
 
+    /// Concurrency and overall budget, for the cross-prober comparison in
+    /// `lib.rs`. The two strategies are private and differently shaped; this is
+    /// the pair that decides how much of the space gets searched.
+    #[cfg(test)]
+    pub(crate) fn strategy_for_test(&self) -> (usize, Duration) {
+        let s = self.strategy();
+        (s.concurrency, s.overall_deadline)
+    }
+
     fn strategy(&self) -> WgStrategy {
         match self {
             WgScanMode::Turbo => WgStrategy {
-                concurrency: 12,
+                concurrency: 20,
                 per_probe_timeout: Duration::from_millis(5000),
                 overall_deadline: Duration::from_secs(30),
                 quiet_after_first: Duration::from_secs(0),
@@ -61,10 +170,16 @@ impl WgScanMode {
                 sample_per_cidr: 40,
                 pool_port_waves: 1,
             },
+            // Sixteen and two minutes, matching the MASQUE prober. WireGuard
+            // searches a larger space -- fifty-four ports against MASQUE's
+            // handful -- and was given half the concurrency and two thirds the
+            // budget, which covered about one candidate in forty before giving
+            // up. Failure was close to arithmetic rather than evidence the
+            // network was blocking anything.
             WgScanMode::Balanced => WgStrategy {
-                concurrency: 8,
-                per_probe_timeout: Duration::from_millis(7000),
-                overall_deadline: Duration::from_secs(80),
+                concurrency: 16,
+                per_probe_timeout: Duration::from_millis(6000),
+                overall_deadline: Duration::from_secs(120),
                 quiet_after_first: Duration::from_secs(12),
                 target_successes: 5,
                 early_exit_first: false,
@@ -279,6 +394,90 @@ fn distinct_by_ip(found: &[WgProbeResult]) -> Vec<WgProbeResult> {
     sorted.into_iter().filter(|pr| seen.insert(pr.ip)).collect()
 }
 
+/// Every endpoint that answers, best first, rather than only the best one.
+///
+/// [`hunt_best_wg_endpoint`] exists to start a tunnel and stops as soon as it
+/// has an answer it likes. This one is for the endpoint list a user picks from,
+/// so it keeps collecting until the limit, the deadline, or a cancellation --
+/// the same shape as the MASQUE scanner, so the app can drive both the same way.
+pub async fn scan_wg_endpoints(
+    probe: &WgProbe,
+    mode: WgScanMode,
+    limit: usize,
+    cancelled: &std::sync::atomic::AtomicBool,
+) -> Result<Vec<WgProbeResult>> {
+    let mut st = mode.strategy();
+    st.concurrency = crate::sysprofile::cap_concurrency(st.concurrency);
+    // Stopping at the first hit is right for connecting and wrong for listing.
+    st.early_exit_first = false;
+    let timeout = st.per_probe_timeout;
+
+    let mut effective_ip = probe.ip;
+    if probe.ip.want_v6() && !crate::prober::host_has_ipv6().await {
+        if probe.ip.want_v4() {
+            log::warn!("[-] host has no IPv6 route; falling back to IPv4-only scan");
+            effective_ip = IpScan::V4;
+        } else {
+            return Err(AetherError::NoCleanEndpoint);
+        }
+    }
+    let candidates = build_wg_candidates(&st, &probe.ports, effective_ip, &probe.excluded);
+    log::info!(
+        "[*] wireguard endpoint scan mode={} ip={} candidates={} limit={}",
+        mode.label(),
+        effective_ip.label(),
+        candidates.len(),
+        limit,
+    );
+
+    let ironclad = mode == WgScanMode::Ironclad;
+    begin_probe_pass();
+    let stream = futures::stream::iter(
+        candidates
+            .into_iter()
+            .map(|(ip, port)| verify_one_wg(probe, ip, port, timeout, ironclad)),
+    )
+    .buffer_unordered(st.concurrency);
+    tokio::pin!(stream);
+
+    let deadline = Instant::now() + st.overall_deadline;
+    let mut found: Vec<WgProbeResult> = Vec::new();
+
+    loop {
+        if cancelled.load(std::sync::atomic::Ordering::Relaxed) {
+            log::info!("[*] wireguard scan cancelled");
+            break;
+        }
+        if limit > 0 && found.len() >= limit {
+            break;
+        }
+        let remaining = deadline.saturating_duration_since(Instant::now());
+        if remaining.is_zero() {
+            break;
+        }
+
+        tokio::select! {
+            item = stream.next() => match item {
+                None => break,
+                Some(None) => continue,
+                Some(Some(result)) => {
+                    log::info!("[+] wg endpoint ok {}:{} rtt={:?}", result.ip, result.port, result.rtt);
+                    found.push(result);
+                }
+            },
+            _ = tokio::time::sleep(remaining) => break,
+        }
+    }
+
+    found.sort_by_key(|result| result.rtt);
+    if found.is_empty() {
+        // The one line that says which kind of failure this was.
+        log::info!("[-] wireguard scan found nothing: {}", probe_pass_summary());
+        return Err(AetherError::NoCleanEndpoint);
+    }
+    Ok(found)
+}
+
 async fn verify_one_wg(
     probe: &WgProbe,
     ip: IpAddr,
@@ -303,6 +502,7 @@ async fn verify_one_wg(
         Ok(v) => v,
         Err(e) => {
             log::trace!("wg probe {ip}:{port} -> {e}");
+            PROBE_TALLY.record(&e);
             return None;
         }
     };
@@ -332,6 +532,7 @@ async fn verify_one_wg(
         }
         Err(e) => {
             log::trace!("[-] ironclad wg {ip}:{port} failed real http check: {e}");
+            PROBE_TALLY.rejected.fetch_add(1, Ordering::Relaxed);
             None
         }
     }

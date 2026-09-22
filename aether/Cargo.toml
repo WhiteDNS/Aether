@@ -3,14 +3,15 @@ name = "aether"
 version = "2.0.0"
 edition = "2021"
 rust-version = "1.98"
-authors = ["CluvexStudio"]
-license = "AGPL-3.0-only"
-repository = "https://github.com/CluvexStudio/aether"
 
 [lib]
 name = "aether"
 path = "src/lib.rs"
-crate-type = ["lib", "staticlib", "cdylib"]
+# Upstream also builds a cdylib and a staticlib to export src/ffi.rs as a C
+# API. That file is not vendored here -- native/android-bridge is this
+# project's FFI -- so those two would package a ~900 KB libaether.so per
+# ABI with no entry point anything loads.
+crate-type = ["lib"]
 
 [[bin]]
 name = "aether"
@@ -22,6 +23,12 @@ boring = "4.22"
 foreign-types-shared = "0.3"
 libc = "0.2"
 tokio = { version = "1.52", features = ["rt-multi-thread", "macros", "net", "time", "sync", "io-util", "io-std", "signal"] }
+# "socks" because registration is the one request that goes out through
+# reqwest rather than through this crate's own dialler, and Upstream
+# hands it a socks5:// proxy. Without the feature Proxy::all still accepts
+# the URL and every request through it then fails instantly with a bare
+# "error sending request" -- a proxy that looks configured and carries
+# nothing.
 reqwest = { version = "0.12", default-features = false, features = ["json", "rustls-tls", "cookies", "socks"] }
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
@@ -50,16 +57,31 @@ h2 = "0.4.15"
 http = "1"
 bytes = "1"
 tokio-boring = "4.22"
-arti-client = { version = "0.46", default-features = false, features = ["tokio", "rustls", "compression", "static-sqlite", "bridge-client", "pt-client"], optional = true }
-tor-chanmgr = { version = "0.46", optional = true }
-tor-rtcompat = { version = "0.46", default-features = false, features = ["tokio", "rustls"], optional = true }
-tokio-util = { version = "0.7", features = ["compat"], optional = true }
-liblzma = { version = "0.4", features = ["static"], optional = true }
-tracing-subscriber = { version = "0.3", default-features = false, features = ["fmt", "env-filter", "ansi"], optional = true }
 
-[features]
-default = []
-tor = ["dep:arti-client", "dep:tor-chanmgr", "dep:tor-rtcompat", "dep:tokio-util", "dep:liblzma", "dep:tracing-subscriber"]
+# Upstream's `tor` feature and the six optional crates behind it -- arti-client,
+# tor-chanmgr, tor-rtcompat, tokio-util, liblzma, tracing-subscriber -- are
+# deliberately not carried. Every use of them sits behind `#[cfg(feature =
+# "tor")]` in src/tor.rs, which has stubs for the other side, so leaving them
+# out costs nothing but the ability to turn the feature on.
+#
+# Turning it on is what this project cannot do. Upstream's Tor arrives with
+# pluggable transports built as Go binaries, and one Go runtime per process is a
+# rule this tree already pays for once in native/chain. This app reaches tor
+# through info.guardianproject:tor-android instead, in its own process, with its
+# transports as separate executables -- see native/tor. src/bridges.rs likewise
+# duplicates core/MoatClient.kt. And liblzma with features = ["static"] would
+# mean a C build for every Android ABI the first time anyone flipped the switch.
+#
+# Left in, they would add roughly 4,800 lines to Cargo.lock for code that is
+# never compiled, and THIRD_PARTY_NOTICES.md would have to either list them or
+# explain why not.
+
+[lints.rust]
+# src/tor.rs is vendored whole, including the cfgs for a `tor` feature this
+# manifest deliberately does not declare -- see the note in [dependencies].
+# Naming the value here keeps those cfgs recognised, without offering a switch
+# that would fail to build because the crates behind it are not here.
+unexpected_cfgs = { level = "warn", check-cfg = ['cfg(feature, values("tor"))'] }
 
 [profile.release]
 opt-level = 3

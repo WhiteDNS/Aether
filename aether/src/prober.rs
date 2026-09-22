@@ -192,6 +192,15 @@ impl ScanMode {
         }
     }
 
+    /// Concurrency and overall budget, for the cross-prober comparison in
+    /// `lib.rs`. The two strategies are private and differently shaped; this is
+    /// the pair that decides how much of the space gets searched.
+    #[cfg(test)]
+    pub(crate) fn strategy_for_test(&self) -> (usize, Duration) {
+        let s = self.strategy();
+        (s.concurrency, s.overall_deadline)
+    }
+
     fn strategy(&self) -> Strategy {
         match self {
             ScanMode::Turbo => Strategy {
@@ -282,6 +291,130 @@ pub async fn host_has_ipv6() -> bool {
     }
 }
 
+/// Why one MASQUE probe produced no gateway.
+///
+/// Classified rather than discarded. Every failure used to become `None` at
+/// trace level, so three thousand probes failing for one reason and three
+/// thousand failing because the network is hostile ended as the same sentence:
+/// `no clean endpoint found`. That sentence blames the network, and in the
+/// incident that produced this it was wrong every time.
+///
+/// Read off the error variant where the variant is enough, and off the message
+/// only for the finer splits the variants do not carry. The types underneath --
+/// quic, masque_h2, tls -- still speak in strings; narrowing that is a larger
+/// change than this, and this is the part that decides what the engine does
+/// next.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord)]
+pub enum ProbeFailure {
+    /// Nothing came back before the deadline.
+    NoAnswer,
+    /// The address refused the connection outright.
+    Refused,
+    /// TLS completed and the certificate was not one we accept.
+    PinMismatch,
+    /// TLS itself would not complete.
+    TlsRejected,
+    /// The gateway answered the connect-ip request with a refusal.
+    ConnectIpRefused,
+    /// A tunnel opened and closed before carrying anything.
+    NoDataPlane,
+    Other,
+}
+
+impl ProbeFailure {
+    pub fn label(self) -> &'static str {
+        match self {
+            ProbeFailure::NoAnswer => "no answer",
+            ProbeFailure::Refused => "refused",
+            ProbeFailure::PinMismatch => "certificate not ours",
+            ProbeFailure::TlsRejected => "tls refused",
+            ProbeFailure::ConnectIpRefused => "connect-ip refused",
+            ProbeFailure::NoDataPlane => "opened, carried nothing",
+            ProbeFailure::Other => "other",
+        }
+    }
+
+    /// Whether every address in the pool would fail this way.
+    ///
+    /// A certificate we do not accept, or a request the gateway refuses, is a
+    /// fault in what we are sending -- not in which address we sent it to. No
+    /// number of further probes changes it, and spending the budget to confirm
+    /// that is how a fixable fault comes to look like censorship.
+    pub fn is_common_mode(self) -> bool {
+        matches!(
+            self,
+            ProbeFailure::PinMismatch | ProbeFailure::ConnectIpRefused
+        )
+    }
+
+    fn of(error: &AetherError) -> Self {
+        let text = error.to_string().to_ascii_lowercase();
+        match error {
+            AetherError::Tls(_) if text.contains("application verification") => {
+                ProbeFailure::PinMismatch
+            }
+            AetherError::Tls(_) => ProbeFailure::TlsRejected,
+            AetherError::Io(e) if e.kind() == std::io::ErrorKind::ConnectionRefused => {
+                ProbeFailure::Refused
+            }
+            AetherError::Io(e) if e.kind() == std::io::ErrorKind::TimedOut => {
+                ProbeFailure::NoAnswer
+            }
+            _ if text.contains("connect-ip status") => ProbeFailure::ConnectIpRefused,
+            _ if text.contains("before data-plane") || text.contains("carried anything") => {
+                ProbeFailure::NoDataPlane
+            }
+            _ if text.contains("timed out") || text.contains("deadline") => ProbeFailure::NoAnswer,
+            _ if text.contains("refused") => ProbeFailure::Refused,
+            _ => ProbeFailure::Other,
+        }
+    }
+}
+
+/// What a run of probes ran into, for the log and for the decision to stop.
+#[derive(Debug, Default, Clone)]
+pub struct FailureTally {
+    counts: std::collections::BTreeMap<ProbeFailure, usize>,
+    total: usize,
+}
+
+/// Probes to see before one repeated answer is believed to be about all of them.
+const COMMON_MODE_SAMPLE: usize = 40;
+
+/// The share of that sample one kind has to hold.
+const COMMON_MODE_SHARE: f64 = 0.9;
+
+impl FailureTally {
+    fn record(&mut self, kind: ProbeFailure) {
+        *self.counts.entry(kind).or_insert(0) += 1;
+        self.total += 1;
+    }
+
+    /// The kind that is answering for effectively all of them, if there is one.
+    fn common_mode(&self) -> Option<(ProbeFailure, usize)> {
+        if self.total < COMMON_MODE_SAMPLE {
+            return None;
+        }
+        self.counts
+            .iter()
+            .find(|(kind, count)| {
+                kind.is_common_mode() && **count as f64 >= self.total as f64 * COMMON_MODE_SHARE
+            })
+            .map(|(kind, count)| (*kind, *count))
+    }
+
+    pub fn summary(&self) -> String {
+        if self.total == 0 {
+            return "nothing was probed".to_string();
+        }
+        self.counts
+            .iter()
+            .map(|(kind, count)| format!("{}={count}", kind.label()))
+            .collect::<Vec<_>>()
+            .join(" ")
+    }
+}
+
 pub async fn hunt_best_gateway(probe: &MasqueProbe, mode: ScanMode) -> Result<ProbeResult> {
     let mut st = mode.strategy();
     st.concurrency = crate::sysprofile::cap_concurrency(st.concurrency);
@@ -323,6 +456,7 @@ pub async fn hunt_best_gateway(probe: &MasqueProbe, mode: ScanMode) -> Result<Pr
     let mut best: Option<ProbeResult> = None;
     let mut found = 0usize;
     let mut quiet_until: Option<Instant> = None;
+    let mut tally = FailureTally::default();
 
     loop {
         let effective = match quiet_until {
@@ -338,7 +472,10 @@ pub async fn hunt_best_gateway(probe: &MasqueProbe, mode: ScanMode) -> Result<Pr
                     log::warn!("[-] scan deadline reached");
                 }
             } else {
-                log::warn!("[-] scan deadline reached with no gateway");
+                log::warn!(
+                    "[-] scan deadline reached with no gateway ({})",
+                    tally.summary()
+                );
             }
             break;
         }
@@ -347,8 +484,28 @@ pub async fn hunt_best_gateway(probe: &MasqueProbe, mode: ScanMode) -> Result<Pr
             item = stream.next() => {
                 match item {
                     None => break,
-                    Some(None) => continue,
-                    Some(Some(pr)) => {
+                    Some(Err(why)) => {
+                        tally.record(why);
+                        // One answer repeated by everything is about what we are
+                        // sending, not about where we sent it. Confirming that
+                        // across the remaining candidates costs the whole budget
+                        // and teaches nothing.
+                        if best.is_none() {
+                            if let Some((kind, count)) = tally.common_mode() {
+                                log::warn!(
+                                    "[-] stopping the scan: {count} of {} probes answered the same                                      way ({}), which is not about the address",
+                                    tally.total,
+                                    kind.label()
+                                );
+                                return Err(AetherError::Other(format!(
+                                    "every gateway answered the same way ({}); this is not the                                      network",
+                                    kind.label()
+                                )));
+                            }
+                        }
+                        continue;
+                    }
+                    Some(Ok(pr)) => {
                         log::info!("[+] candidate ok {}:{} rtt={:?}", pr.ip, pr.port, pr.rtt);
                         if st.early_exit_first {
                             return Ok(pr);
@@ -378,7 +535,10 @@ pub async fn hunt_best_gateway(probe: &MasqueProbe, mode: ScanMode) -> Result<Pr
                         log::warn!("[-] scan deadline reached");
                     }
                 } else {
-                    log::warn!("[-] scan deadline reached with no gateway");
+                    log::warn!(
+                        "[-] scan deadline reached with no gateway ({})",
+                        tally.summary()
+                    );
                 }
                 break;
             }
@@ -390,16 +550,13 @@ pub async fn hunt_best_gateway(probe: &MasqueProbe, mode: ScanMode) -> Result<Pr
             log::info!("[+] best gateway {}:{} rtt={:?}", pr.ip, pr.port, pr.rtt);
             Ok(pr)
         }
-        None => Err(AetherError::NoCleanEndpoint),
+        None => {
+            log::warn!("[-] nothing answered ({})", tally.summary());
+            Err(AetherError::NoCleanEndpoint)
+        }
     }
 }
 
-/// Ranks reachable gateways instead of stopping at the first one.
-///
-/// [`hunt_best_gateway`] answers "what should I connect to"; this answers "what
-/// is out there", which is a different question and needs a different shape:
-/// several results, a cap on how many, and a way to give up half way when the
-/// person who asked has moved on.
 pub async fn scan_gateways(
     probe: &MasqueProbe,
     mode: ScanMode,
@@ -408,12 +565,6 @@ pub async fn scan_gateways(
 ) -> Result<Vec<ProbeResult>> {
     let mut st = mode.strategy();
     st.concurrency = crate::sysprofile::cap_concurrency(st.concurrency);
-    // Turbo's zero quiet window means "stop at the first working gateway", which
-    // is what connecting wants and the opposite of what a scan is for: it
-    // returned exactly one result however many were asked for.
-    if st.quiet_after_first.is_zero() {
-        st.quiet_after_first = Duration::from_secs(8);
-    }
     let timeout = st.per_probe_timeout;
     let mut effective_ip = probe.ip;
     if probe.ip.want_v6() && !host_has_ipv6().await {
@@ -423,7 +574,7 @@ pub async fn scan_gateways(
             return Err(AetherError::NoCleanEndpoint);
         }
     }
-    let candidates = spread_seeds(build_candidates(&st, &probe.ports, effective_ip));
+    let candidates = build_candidates(&st, &probe.ports, effective_ip);
     let ironclad = mode == ScanMode::Ironclad;
     let stream = futures::stream::iter(
         candidates
@@ -436,7 +587,7 @@ pub async fn scan_gateways(
     let limit = limit.clamp(1, 16);
     let deadline = Instant::now() + st.overall_deadline;
     let mut quiet_until: Option<Instant> = None;
-    let mut results: Vec<ProbeResult> = Vec::new();
+    let mut results = Vec::new();
 
     loop {
         if cancelled.load(Ordering::Relaxed) {
@@ -452,25 +603,25 @@ pub async fn scan_gateways(
             item = stream.next() => {
                 match item {
                     None => break,
-                    Some(None) => continue,
-                    Some(Some(result)) => {
-                        if !results
-                            .iter()
-                            .any(|existing| existing.ip == result.ip && existing.port == result.port)
-                        {
+                    Some(Err(_)) => continue,
+                    Some(Ok(result)) => {
+                        if !results.iter().any(|existing: &ProbeResult| {
+                            existing.ip == result.ip && existing.port == result.port
+                        }) {
                             results.push(result);
                             results.sort_by_key(|entry| entry.rtt);
                             if results.len() >= limit {
                                 break;
                             }
                         }
+                        if st.quiet_after_first.is_zero() {
+                            break;
+                        }
                         quiet_until = Some(Instant::now() + st.quiet_after_first);
                     }
                 }
             }
             _ = tokio::time::sleep(remaining) => break,
-            // Wakes the loop often enough that a cancellation is noticed while
-            // the probes are still running, rather than at the deadline.
             _ = tokio::time::sleep(Duration::from_millis(100)) => {}
         }
     }
@@ -485,58 +636,13 @@ pub async fn scan_gateways(
     }
 }
 
-/// One seed for every this many sampled addresses, when scanning.
-const SEED_SPACING: usize = 3;
-
-/// Spreads the fixed seed gateways through the sampled ones.
-///
-/// [`build_candidates`] puts the seeds first, which is right for connecting:
-/// they are the shortest path to a working tunnel. It is wrong for scanning.
-/// The seed list is eight addresses and a scan asks for eight results, so on any
-/// network where the seeds answer the list fills with them and no sampled
-/// address is ever reached -- which is why every search depth returned the same
-/// handful.
-///
-/// The seeds are kept, just not allowed to monopolise the first wave.
-fn spread_seeds(candidates: Vec<(IpAddr, u16)>) -> Vec<(IpAddr, u16)> {
-    let seed_count = candidates
-        .iter()
-        .take_while(|(address, _)| is_seed(address))
-        .count();
-    if seed_count == 0 || candidates.len() <= seed_count {
-        return candidates;
-    }
-
-    let (seeds, sampled) = candidates.split_at(seed_count);
-    let mut seeds = seeds.iter();
-    let mut out = Vec::with_capacity(candidates.len());
-    for (index, entry) in sampled.iter().enumerate() {
-        if index % SEED_SPACING == SEED_SPACING - 1 {
-            if let Some(seed) = seeds.next() {
-                out.push(*seed);
-            }
-        }
-        out.push(*entry);
-    }
-    // Any seeds left over when the sampled list is short still get probed.
-    out.extend(seeds);
-    out
-}
-
-fn is_seed(address: &IpAddr) -> bool {
-    match address {
-        IpAddr::V4(v4) => MASQUE_SEEDS.iter().any(|seed| seed.parse() == Ok(*v4)),
-        IpAddr::V6(v6) => MASQUE_SEEDS_V6.iter().any(|seed| seed.parse() == Ok(*v6)),
-    }
-}
-
 async fn verify_one(
     probe: &MasqueProbe,
     ip: IpAddr,
     port: u16,
     timeout: Duration,
     ironclad: bool,
-) -> Option<ProbeResult> {
+) -> std::result::Result<ProbeResult, ProbeFailure> {
     if ironclad {
         let params = crate::tunnelping::MasquePingParams {
             peer: SocketAddr::new(ip, port),
@@ -556,11 +662,11 @@ async fn verify_one(
                     "[+] ironclad verified {ip}:{port} real http round trip rtt={:?}",
                     rtt
                 );
-                Some(ProbeResult { ip, port, rtt })
+                Ok(ProbeResult { ip, port, rtt })
             }
             Err(e) => {
-                log::trace!("[-] ironclad {ip}:{port} failed real http check: {e}");
-                None
+                log::debug!("[-] ironclad {ip}:{port} failed real http check: {e}");
+                Err(ProbeFailure::of(&e))
             }
         };
     }
@@ -576,16 +682,16 @@ async fn verify_one(
             local_ipv4: probe.local_ipv4,
             quiet: true,
             pin_endpoint: true,
-            expected_pins: crate::consts::MASQUE_PINS
+            expected_pins: crate::consts::masque_pins()
                 .iter()
                 .map(|p| p.to_vec())
                 .collect(),
         };
         return match crate::masque_h2::verify_h2(&cfg, timeout).await {
-            Ok(rtt) => Some(ProbeResult { ip, port, rtt }),
+            Ok(rtt) => Ok(ProbeResult { ip, port, rtt }),
             Err(e) => {
-                log::trace!("h2 probe {ip}:{port} -> {e}");
-                None
+                log::debug!("h2 probe {ip}:{port} -> {e}");
+                Err(ProbeFailure::of(&e))
             }
         };
     }
@@ -604,10 +710,10 @@ async fn verify_one(
     };
 
     match quic::verify_masque(&vp).await {
-        Ok(rtt) => Some(ProbeResult { ip, port, rtt }),
+        Ok(rtt) => Ok(ProbeResult { ip, port, rtt }),
         Err(e) => {
-            log::trace!("probe {ip}:{port} -> {e}");
-            None
+            log::debug!("probe {ip}:{port} -> {e}");
+            Err(ProbeFailure::of(&e))
         }
     }
 }
@@ -821,61 +927,6 @@ fn sample_cidr_v6(cidr: &str, n: usize, v4_cidrs: &[&str]) -> Vec<Ipv6Addr> {
 mod tests {
     use super::*;
 
-    fn v4(address: &str) -> IpAddr {
-        IpAddr::V4(address.parse().unwrap())
-    }
-
-    #[test]
-    fn scanning_does_not_let_the_seeds_fill_the_whole_result_list() {
-        // The seeds are as long as the result limit a scan asks for, so
-        // front-loaded they answer first, fill the list, and no sampled address
-        // is ever reached -- every search depth then returns the same handful.
-        let mut candidates: Vec<(IpAddr, u16)> =
-            MASQUE_SEEDS.iter().map(|s| (v4(s), 443)).collect();
-        for octet in 1..=40 {
-            candidates.push((v4(&format!("104.17.0.{octet}")), 443));
-        }
-
-        let spread = spread_seeds(candidates.clone());
-        assert_eq!(spread.len(), candidates.len(), "nothing may be dropped");
-
-        let first_wave = &spread[..MASQUE_SEEDS.len()];
-        let seeds_up_front = first_wave.iter().filter(|(a, _)| is_seed(a)).count();
-        assert!(
-            seeds_up_front < MASQUE_SEEDS.len(),
-            "seeds still monopolise the first wave: {seeds_up_front}",
-        );
-        assert!(
-            seeds_up_front > 0,
-            "seeds are known-good and must still be probed early",
-        );
-    }
-
-    #[test]
-    fn every_seed_is_still_probed() {
-        let mut candidates: Vec<(IpAddr, u16)> =
-            MASQUE_SEEDS.iter().map(|s| (v4(s), 443)).collect();
-        candidates.push((v4("104.17.0.1"), 443));
-        let spread = spread_seeds(candidates);
-        let seeds = spread.iter().filter(|(a, _)| is_seed(a)).count();
-        // A short sampled list must not strand the seeds that did not fit
-        // between its entries.
-        assert_eq!(seeds, MASQUE_SEEDS.len());
-    }
-
-    #[test]
-    fn a_list_with_no_sampled_addresses_is_returned_unchanged() {
-        let candidates: Vec<(IpAddr, u16)> = MASQUE_SEEDS.iter().map(|s| (v4(s), 443)).collect();
-        assert_eq!(spread_seeds(candidates.clone()), candidates);
-    }
-
-    #[test]
-    fn the_edge_ranges_are_searched_as_well_as_the_dedicated_ones() {
-        // An address in 104.25 was confirmed working from a network where the
-        // dedicated ranges answered nothing at all.
-        assert!(MASQUE_CDN_CIDRS_V4.contains(&"104.25.0.0/16"));
-    }
-
     #[test]
     fn the_documented_zero_trust_masque_ingress_range_is_scanned() {
         assert!(MASQUE_CIDRS_V4.contains(&"162.159.197.0/24"));
@@ -923,6 +974,110 @@ mod tests {
         };
         assert_eq!(out, vec!["c", "a", "b", "d"]);
         assert_eq!(out.len(), all.len());
+    }
+
+    /// Everything answering the same way is not a statement about the network.
+    ///
+    /// The whole incident in miniature: a certificate we do not accept, or a
+    /// request the gateway refuses, fails identically at every address. Spending
+    /// the budget to confirm that across three thousand of them is how a
+    /// fixable fault comes to look like censorship.
+    #[test]
+    fn one_answer_repeated_by_everything_stops_the_scan() {
+        let mut tally = FailureTally::default();
+        for _ in 0..COMMON_MODE_SAMPLE {
+            tally.record(ProbeFailure::PinMismatch);
+        }
+        assert_eq!(
+            Some((ProbeFailure::PinMismatch, COMMON_MODE_SAMPLE)),
+            tally.common_mode(),
+        );
+    }
+
+    /// A hostile network is not a common-mode fault, and must not stop the scan.
+    ///
+    /// Silence and refusal are exactly what a blocked address looks like, and
+    /// the next address may well answer. Only a fault in what we send counts.
+    #[test]
+    fn a_network_that_drops_everything_does_not_stop_the_scan() {
+        let mut tally = FailureTally::default();
+        for _ in 0..COMMON_MODE_SAMPLE * 4 {
+            tally.record(ProbeFailure::NoAnswer);
+        }
+        assert_eq!(None, tally.common_mode());
+
+        let mut refused = FailureTally::default();
+        for _ in 0..COMMON_MODE_SAMPLE * 4 {
+            refused.record(ProbeFailure::Refused);
+        }
+        assert_eq!(None, refused.common_mode());
+    }
+
+    /// Too few probes is not evidence about the rest of them.
+    #[test]
+    fn a_handful_of_probes_is_not_enough_to_conclude_anything() {
+        let mut tally = FailureTally::default();
+        for _ in 0..COMMON_MODE_SAMPLE - 1 {
+            tally.record(ProbeFailure::ConnectIpRefused);
+        }
+        assert_eq!(None, tally.common_mode());
+        tally.record(ProbeFailure::ConnectIpRefused);
+        assert!(tally.common_mode().is_some());
+    }
+
+    /// A mixture is a network, not a fault in what we send.
+    #[test]
+    fn a_mixture_of_answers_is_not_a_common_mode_fault() {
+        let mut tally = FailureTally::default();
+        for index in 0..COMMON_MODE_SAMPLE * 2 {
+            tally.record(if index % 2 == 0 {
+                ProbeFailure::PinMismatch
+            } else {
+                ProbeFailure::NoAnswer
+            });
+        }
+        assert_eq!(None, tally.common_mode());
+    }
+
+    /// The failures the incident actually produced, named from the real errors.
+    #[test]
+    fn the_answers_this_incident_produced_are_classified() {
+        let cases = [
+            (
+                AetherError::Tls(
+                    "h2 tls handshake: TLS handshake failed: cert verification failed -                      application verification failure"
+                        .into(),
+                ),
+                ProbeFailure::PinMismatch,
+            ),
+            (
+                AetherError::Masque("h2 connect-ip status 400; cf-ray=-".into()),
+                ProbeFailure::ConnectIpRefused,
+            ),
+            (
+                AetherError::Other("closed before data-plane confirmation".into()),
+                ProbeFailure::NoDataPlane,
+            ),
+            (
+                AetherError::Tls("TLS handshake failed: handshake timed out".into()),
+                ProbeFailure::TlsRejected,
+            ),
+        ];
+        for (error, expected) in cases {
+            assert_eq!(expected, ProbeFailure::of(&error), "{error}");
+        }
+    }
+
+    /// The summary names every kind it saw, so a report can be read.
+    #[test]
+    fn the_summary_says_what_was_seen() {
+        let mut tally = FailureTally::default();
+        tally.record(ProbeFailure::NoAnswer);
+        tally.record(ProbeFailure::NoAnswer);
+        tally.record(ProbeFailure::PinMismatch);
+        let summary = tally.summary();
+        assert!(summary.contains("no answer=2"), "{summary}");
+        assert!(summary.contains("certificate not ours=1"), "{summary}");
     }
 
     #[test]

@@ -1,3 +1,18 @@
+//! Everything the engine opens to the network passes through here.
+//!
+//! Upstream built this module to set a firewall mark, so that a Linux box can
+//! route the engine's own traffic around the tunnel it is building. Android
+//! needs the same thing and cannot do it that way -- `SO_MARK` wants root or
+//! CAP_NET_ADMIN, and an app has neither. What it has instead is
+//! `VpnService.protect()`, which this fork reaches through
+//! [`crate::socketprotect`].
+//!
+//! So both live here, in [`apply`]. That is what one choke point is for: every
+//! outbound socket is made in one place, so that a new caller cannot forget.
+//! Before it, protection was injected separately into dns, wireguard and the
+//! probers, and an unprotected socket is not a visible failure -- it is routed
+//! into the interface being replaced, where nothing ever answers.
+
 use std::io;
 use std::net::SocketAddr;
 use std::sync::atomic::{AtomicU32, Ordering};
@@ -64,6 +79,13 @@ pub fn apply(socket: SockRef<'_>) -> io::Result<()> {
             socket.set_mark(mark)?;
         }
     }
+
+    // Before the connect, which is the only window there is: once the SYN has
+    // gone out it has already taken whichever interface held the default route.
+    // Fails open where no protector is installed -- desktop, and proxy mode --
+    // which is why socketprotect counts the sockets that went out unprotected.
+    crate::socketprotect::protect(&*socket).map_err(|error| io::Error::other(error.to_string()))?;
+
     #[cfg(not(any(target_os = "linux", target_os = "android")))]
     let _ = socket;
     Ok(())

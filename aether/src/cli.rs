@@ -74,12 +74,6 @@ MASQUE-in-MASQUE endpoints:
   --mim-scan               find the outer hop by scanning, ignoring any endpoint
                            left in the environment
 
-Report gateways without connecting (prints one JSON object on stdout):
-  --scan-only              rank reachable MASQUE gateways by round-trip time
-  --scan-limit <n>         how many to report (default 8, max 16)
-  --test-endpoint <ip:port>
-                           validate one gateway with a real authenticated handshake
-
 Scan mode:
   --scan <mode>            turbo | balanced | thorough | stealth | ironclad
   --turbo                  stop at the first candidate that answers
@@ -422,10 +416,6 @@ pub fn parse_args(args: Vec<String>) -> crate::error::Result<Parsed> {
 
             "--keepalive" => set("AETHER_WG_KEEPALIVE", next_value!()),
             "--no-profile-retry" => set("AETHER_WG_NO_PROFILE_RETRY", "1"),
-
-            "--scan-only" => set("AETHER_SCAN_ONLY", "1"),
-            "--scan-limit" => set("AETHER_SCAN_LIMIT", next_value!()),
-            "--test-endpoint" => set("AETHER_TEST_ENDPOINT", next_value!()),
 
             "--config" => set("AETHER_CONFIG", next_value!()),
             "--wg-config" => set("AETHER_WG_CONFIG", next_value!()),

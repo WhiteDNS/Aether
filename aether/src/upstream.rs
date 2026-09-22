@@ -57,9 +57,40 @@ impl std::fmt::Debug for Upstream {
     }
 }
 
-pub fn configured() -> Option<&'static Upstream> {
-    static UPSTREAM: std::sync::OnceLock<Option<Upstream>> = std::sync::OnceLock::new();
-    UPSTREAM.get_or_init(Upstream::from_env).as_ref()
+/// The upstream proxy to dial through, as it is configured right now.
+///
+/// Read on every call rather than fixed at the first one. A proxy on the same
+/// device -- which is what the Android app points this at when it chains one
+/// carrier through another -- binds a fresh port every time it starts, so a
+/// value cached for the life of the process goes on dialling the port of a
+/// carrier that has since been replaced. That arrives as a refused connection
+/// from a proxy which is in fact running perfectly well, and no amount of
+/// retrying can fix it. Caching also meant that a process which started without
+/// a proxy could never acquire one.
+///
+/// Parsing a short string per connection costs less than being wrong about it.
+pub fn configured() -> Option<Upstream> {
+    Upstream::from_env()
+}
+
+/// Whether this setting has changed since it was last reported.
+///
+/// Reading the environment per connection would otherwise repeat the same line
+/// for every dial. Only a change is worth saying out loud.
+fn is_new(raw: &str) -> bool {
+    static LAST: std::sync::Mutex<Option<String>> = std::sync::Mutex::new(None);
+    match LAST.lock() {
+        Ok(mut last) => {
+            if last.as_deref() == Some(raw) {
+                false
+            } else {
+                *last = Some(raw.to_owned());
+                true
+            }
+        }
+        // A poisoned lock is no reason to lose the line.
+        Err(_) => true,
+    }
 }
 
 impl Upstream {
@@ -72,16 +103,20 @@ impl Upstream {
 
         match Self::parse(trimmed) {
             Ok(upstream) => {
-                log::info!(
-                    "[+] dialling out through the {} proxy at {}:{}",
-                    upstream.kind.label(),
-                    upstream.host,
-                    upstream.port
-                );
+                if is_new(trimmed) {
+                    log::info!(
+                        "[+] dialling out through the {} proxy at {}:{}",
+                        upstream.kind.label(),
+                        upstream.host,
+                        upstream.port
+                    );
+                }
                 Some(upstream)
             }
             Err(error) => {
-                log::error!("[-] the upstream proxy setting was ignored: {error}");
+                if is_new(trimmed) {
+                    log::error!("[-] the upstream proxy setting was ignored: {error}");
+                }
                 None
             }
         }
@@ -175,6 +210,10 @@ impl Upstream {
 
     pub async fn connect(&self, target: SocketAddr) -> Result<TcpStream> {
         let attempt = async {
+            // The proxy is reached over the network like anything else, so
+            // on Android this socket needs protecting too -- otherwise the
+            // detour meant to carry the tunnel is carried by it. egress
+            // protects everything it opens.
             let mut stream = crate::egress::tcp_connect_host(&self.host, self.port).await?;
             let _ = stream.set_nodelay(true);
 
@@ -224,6 +263,7 @@ impl Upstream {
                 "[::]:0"
             };
             let socket = crate::egress::udp_bind(local.parse().expect("a wildcard address"))?;
+            crate::socketprotect::protect(&socket)?;
             socket.connect(relay).await?;
 
             Ok(UdpRelay {
@@ -454,7 +494,7 @@ pub fn real_source(local: SocketAddr, observed: SocketAddr) -> SocketAddr {
 
 pub async fn attach_detour(socket: &UdpSocket, peer: SocketAddr) -> Result<DetourGuard> {
     match configured() {
-        Some(proxy) => attach_detour_via(proxy, socket, peer).await,
+        Some(proxy) => attach_detour_via(&proxy, socket, peer).await,
         None => Ok(DetourGuard::default()),
     }
 }
@@ -506,6 +546,14 @@ async fn attach_detour_via(
     Ok(DetourGuard(Some((client, id, task.abort_handle()))))
 }
 
+/// Whether a datagram that arrived really came back through this socket's own
+/// detour, rather than from somewhere else that happens to share a port.
+fn from_detoured_socket(client: SocketAddr, origin: SocketAddr) -> bool {
+    origin.port() == client.port()
+        && (origin.ip() == client.ip()
+            || (client.ip().is_unspecified() && origin.ip().is_loopback()))
+}
+
 pub async fn bind_via_upstream(peer: SocketAddr) -> Result<(UdpSocket, SocketAddr, DetourGuard)> {
     let bind = if peer.is_ipv4() {
         "0.0.0.0:0"
@@ -513,6 +561,10 @@ pub async fn bind_via_upstream(peer: SocketAddr) -> Result<(UdpSocket, SocketAdd
         "[::]:0"
     };
 
+    // Every UDP socket the engine sends on comes from here, which is why
+    // protection belongs in egress rather than at each call site. It used to be
+    // injected separately into dns, wireguard and the probers, and a new caller
+    // had no way of knowing it had to.
     let socket = crate::egress::udp_bind(bind.parse().expect("a wildcard address"))?;
     let detour = attach_detour(&socket, peer).await?;
 
@@ -521,12 +573,6 @@ pub async fn bind_via_upstream(peer: SocketAddr) -> Result<(UdpSocket, SocketAdd
     socket.connect(target).await?;
 
     Ok((socket, target, detour))
-}
-
-fn from_detoured_socket(client: SocketAddr, origin: SocketAddr) -> bool {
-    origin.port() == client.port()
-        && (origin.ip() == client.ip()
-            || (client.ip().is_unspecified() && origin.ip().is_loopback()))
 }
 
 async fn pump(
@@ -763,6 +809,15 @@ async fn relay_address(bound: SocketAddr, host: &str, port: u16) -> Result<Socke
 
 #[cfg(test)]
 mod tests {
+    /// Held by every test that writes AETHER_UPSTREAM.
+    ///
+    /// The tests run on parallel threads and configured() reads the variable on
+    /// every call, so without it one test's assertion can read another's value.
+    fn env_lock() -> std::sync::MutexGuard<'static, ()> {
+        static ENV: std::sync::Mutex<()> = std::sync::Mutex::new(());
+        ENV.lock().unwrap_or_else(|poisoned| poisoned.into_inner())
+    }
+
     use super::*;
 
     #[test]
@@ -920,6 +975,7 @@ mod tests {
     #[tokio::test]
     async fn a_datagram_makes_the_round_trip_through_a_socks5_relay() {
         let (proxy_address, server) = fake_socks_udp_server().await;
+        let _env = env_lock();
         std::env::set_var("AETHER_UPSTREAM", format!("socks5://{proxy_address}"));
 
         let proxy = Upstream::parse(&format!("socks5://{proxy_address}")).unwrap();
@@ -1126,6 +1182,7 @@ mod tests {
 
     #[tokio::test]
     async fn a_local_peer_is_reached_without_the_proxy() {
+        let _env = env_lock();
         std::env::set_var("AETHER_UPSTREAM", "socks5://127.0.0.1:9");
         let socket = UdpSocket::bind("127.0.0.1:0").await.unwrap();
 
@@ -1191,5 +1248,80 @@ mod tests {
         );
         assert_eq!(http_status(b"NOTHTTP 200 OK\r\n\r\n"), None);
         assert_eq!(http_status(b""), None);
+    }
+
+    /// A chained carrier binds a fresh port every time it starts. An upstream
+    /// cached at the first call went on dialling the port of a carrier that had
+    /// since been replaced, and presented as a proxy refusing connections.
+    #[test]
+    fn the_upstream_is_read_again_on_every_call() {
+        let _env = env_lock();
+
+        std::env::set_var("AETHER_UPSTREAM", "socks5://127.0.0.1:36717");
+        assert_eq!(configured().map(|u| u.port), Some(36717));
+
+        std::env::set_var("AETHER_UPSTREAM", "socks5://127.0.0.1:39147");
+        assert_eq!(configured().map(|u| u.port), Some(39147));
+
+        std::env::remove_var("AETHER_UPSTREAM");
+        assert!(configured().is_none());
+    }
+
+    /// Registration goes out through reqwest, which only speaks SOCKS5 when
+    /// built with its "socks" feature. Without it Proxy::all still accepts the
+    /// URL and every request fails instantly without ever reaching the proxy --
+    /// so the proof has to be the proxy seeing the request, not reqwest
+    /// returning an error.
+    #[tokio::test]
+    async fn requests_made_through_reqwest_reach_a_socks5_upstream() {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+
+        let server = tokio::spawn(async move {
+            let (mut client, _) = listener.accept().await.unwrap();
+
+            let mut head = [0u8; 2];
+            client.read_exact(&mut head).await.unwrap();
+            let mut methods = vec![0u8; head[1] as usize];
+            client.read_exact(&mut methods).await.unwrap();
+            client.write_all(&[VER, AUTH_NONE]).await.unwrap();
+
+            let mut request = [0u8; 4];
+            client.read_exact(&mut request).await.unwrap();
+            assert_eq!(
+                request[3], ATYP_V4,
+                "a literal address should arrive as IPv4"
+            );
+            let mut target = [0u8; 6];
+            client.read_exact(&mut target).await.unwrap();
+            client
+                .write_all(&[VER, REP_OK, 0x00, ATYP_V4, 0, 0, 0, 0, 0, 0])
+                .await
+                .unwrap();
+
+            let ip = Ipv4Addr::new(target[0], target[1], target[2], target[3]);
+            let port = u16::from_be_bytes([target[4], target[5]]);
+            (request[1], SocketAddr::new(IpAddr::V4(ip), port))
+        });
+
+        let proxy = Upstream::parse(&format!("socks5://{address}"))
+            .unwrap()
+            .as_reqwest_proxy()
+            .unwrap();
+        let client = reqwest::Client::builder()
+            .proxy(proxy)
+            .timeout(Duration::from_secs(3))
+            .build()
+            .unwrap();
+        // The answer does not matter; the proxy closes after replying. What
+        // matters is that the request got as far as the proxy at all.
+        let _ = client.get("http://192.0.2.1/").send().await;
+
+        let (command, target) = tokio::time::timeout(Duration::from_secs(3), server)
+            .await
+            .expect("reqwest never reached the SOCKS5 upstream")
+            .unwrap();
+        assert_eq!(command, CMD_CONNECT);
+        assert_eq!(target, "192.0.2.1:80".parse::<SocketAddr>().unwrap());
     }
 }

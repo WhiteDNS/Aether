@@ -120,6 +120,27 @@ fn quarantine(path: &str) -> Option<PathBuf> {
     }
 }
 
+/// Reads an identity out of text, without a file behind it.
+///
+/// Import needs exactly the checks [`load`] makes -- the file parses, and the
+/// keys inside it are the right shape -- but on something the user handed us,
+/// before it is allowed anywhere near the identity in use. Sharing the parser
+/// is what stops the two drifting into disagreeing about what is valid.
+pub fn parse(text: &str) -> Result<Identity> {
+    let persisted: PersistedIdentity = toml::from_str(text)
+        .map_err(|e| AetherError::Other(format!("this is not a WhiteAesther identity: {e}")))?;
+    Identity::try_from(persisted)
+        .map_err(|e| AetherError::Other(format!("this identity is not usable: {e}")))
+}
+
+/// Writes an identity that came from somewhere else.
+///
+/// Same private permissions as one we provisioned, because it is the same
+/// secret: anyone holding it can present as this device.
+pub fn write_identity(path: &str, identity: &Identity) -> Result<()> {
+    save(path, identity)
+}
+
 pub fn load(path: &str) -> Result<Option<Identity>> {
     if !Path::new(path).exists() {
         return Ok(None);
@@ -156,7 +177,28 @@ pub fn load(path: &str) -> Result<Option<Identity>> {
     }
 }
 
-fn write_private(path: &str, contents: &str) -> Result<()> {
+/// Reads an identity file without judging it.
+///
+/// [`load`] sets aside anything it cannot parse, which is right for the file in
+/// use and wrong for a sweep across the directory: an identity's siblings
+/// include files that are not identities at all -- the last-connection cache
+/// sits beside them -- and quarantining one for failing to be something it
+/// never was would delete a working cache on every connect.
+///
+/// So this answers one question only, and answers `None` to everything else:
+/// is there an identity here, and which device is it.
+pub fn peek(path: &str) -> Option<Identity> {
+    let text = std::fs::read_to_string(path).ok()?;
+    let persisted: PersistedIdentity = toml::from_str(&text).ok()?;
+    Identity::try_from(persisted).ok()
+}
+
+/// Writes a private file the way an identity has to be written: owner-only,
+/// atomically, and durably enough that a registration survives a power cut.
+///
+/// Shared with the identity store, which holds the same secrets under the same
+/// rules -- and whose whole purpose is that what it wrote is still there.
+pub(crate) fn write_private(path: &str, contents: &str) -> Result<()> {
     let target = Path::new(path);
     let directory = target.parent().filter(|p| !p.as_os_str().is_empty());
     if let Some(dir) = directory {
@@ -196,6 +238,24 @@ fn write_private(path: &str, contents: &str) -> Result<()> {
         }
 
         std::fs::rename(&temporary, target)?;
+
+        // The rename itself, made durable. `sync_all` above puts the contents
+        // on the disk; it says nothing about the directory entry that points at
+        // them, so a phone that loses power here could come back to the old
+        // name or to none. That matters now rather than before, because this is
+        // what a registration is written with, and a registration that is not
+        // on disk has to be bought again from an allowance the address may have
+        // already spent.
+        //
+        // Best effort: a filesystem that will not open a directory for reading
+        // is not a reason to fail a write that has already landed.
+        #[cfg(unix)]
+        if let Some(dir) = directory {
+            if let Ok(handle) = std::fs::File::open(dir) {
+                let _ = handle.sync_all();
+            }
+        }
+
         Ok(())
     })();
 
@@ -207,10 +267,17 @@ fn write_private(path: &str, contents: &str) -> Result<()> {
 }
 
 pub fn save(path: &str, identity: &Identity) -> Result<()> {
+    write_private(path, &to_text(identity)?)
+}
+
+/// The on-disk form of an identity, as text.
+///
+/// Shared with export so what leaves the device is byte-for-byte what the
+/// engine would have written, and comes back through the same parser.
+pub fn to_text(identity: &Identity) -> Result<String> {
     let persisted = PersistedIdentity::from(identity);
-    let text = toml::to_string_pretty(&persisted)
-        .map_err(|e| AetherError::Other(format!("config encode: {e}")))?;
-    write_private(path, &text)
+    toml::to_string_pretty(&persisted)
+        .map_err(|e| AetherError::Other(format!("config encode: {e}")))
 }
 
 pub fn save_masque_creds(

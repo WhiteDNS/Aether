@@ -17,6 +17,20 @@ use crate::{consts, error::AetherError, error::Result};
 pub const MAX_DATAGRAM_SIZE: usize = 1350;
 pub const MIN_DATAGRAM_SIZE: usize = 1200;
 
+/// The smallest send buffer that can still hold a whole client Initial.
+///
+/// quiche pads a client Initial to `MIN_CLIENT_INITIAL_LEN`, and only as far as
+/// the buffer it was given allows, so a buffer under that produces a first
+/// flight padded to less than quiche intends. Legal -- the protocol's floor is
+/// [`MIN_DATAGRAM_SIZE`] -- but not what the library is trying to send.
+///
+/// Worth stating plainly, because a reading of `Stats::sent_bytes` sent this
+/// somewhere wrong: that counter is incremented inside `send_single`, with the
+/// size of the *packet*, before `send_on_path` pads the *datagram* around it.
+/// A first flight reported as 390 bytes therefore went out at 1242. It is not
+/// evidence of a short handshake and nothing here ever was.
+pub const MIN_INITIAL_BUDGET: usize = 1242;
+
 fn net_queue() -> usize {
     crate::sysprofile::channel_capacity()
 }
@@ -37,6 +51,7 @@ async fn bind_udp_fast(bind_addr: SocketAddr) -> Result<UdpSocket> {
     crate::egress::apply(socket2::SockRef::from(&sock)).map_err(AetherError::Io)?;
 
     sock.bind(&bind_addr.into()).map_err(AetherError::Io)?;
+    crate::socketprotect::protect(&sock)?;
     UdpSocket::from_std(sock.into()).map_err(AetherError::Io)
 }
 
@@ -69,9 +84,15 @@ pub struct TunnelConfig {
 }
 
 impl TunnelConfig {
+    /// The send buffer for this connection.
+    ///
+    /// Floored at [`MIN_INITIAL_BUDGET`] rather than [`MIN_DATAGRAM_SIZE`],
+    /// because a buffer between the two is enough for the protocol's minimum
+    /// datagram and not enough for our own client Initial, and quiche pads to
+    /// whatever it is given instead of complaining.
     pub fn datagram_budget(&self) -> usize {
         self.max_datagram
-            .clamp(MIN_DATAGRAM_SIZE, MAX_DATAGRAM_SIZE)
+            .clamp(MIN_INITIAL_BUDGET, MAX_DATAGRAM_SIZE)
     }
 }
 
@@ -311,7 +332,7 @@ pub async fn run(
         cert_pem: &cfg.cert_pem,
         key_pem: &cfg.key_pem,
         pin_endpoint: true,
-        expected_pins: consts::MASQUE_PINS,
+        expected_pins: &consts::masque_pins(),
     })?;
 
     let datagram = cfg.datagram_budget();
@@ -538,8 +559,9 @@ pub async fn run(
                 log_or_debug(
                     quiet,
                     format!(
-                        "peer closed: code=0x{:x} app={} reason={}",
+                        "peer closed: code=0x{:x} ({}) app={} reason={}",
                         e.error_code,
+                        name_close_code(e.error_code),
                         e.is_app,
                         String::from_utf8_lossy(&e.reason)
                     ),
@@ -549,12 +571,25 @@ pub async fn run(
                 log_or_debug(
                     quiet,
                     format!(
-                        "local closed: code=0x{:x} app={} reason={}",
+                        "local closed: code=0x{:x} ({}) app={} reason={}",
                         e.error_code,
+                        name_close_code(e.error_code),
                         e.is_app,
                         String::from_utf8_lossy(&e.reason)
                     ),
                 );
+            }
+
+            // A close before the tunnel ever carried anything is a failure, and
+            // used to be reported as success. Everything above it then saw
+            // "the engine stopped" with no reason -- so Automatic could not
+            // tell a rejected ECH configuration from a blocked port, and moved
+            // on by alternation instead of on evidence.
+            //
+            // A close after it carried traffic is an ending, not a failure, and
+            // still returns Ok.
+            if !established_ever {
+                return Err(describe_early_close(&conn));
             }
             return Ok(());
         }
@@ -768,6 +803,79 @@ async fn do_migrate(
     Ok(())
 }
 
+/// Why a connection closed before it ever carried anything.
+///
+/// The code alone is not an explanation. A QUIC CRYPTO_ERROR carries the TLS
+/// alert in its low byte, so 0x179 is alert 121 -- the server demanding an ECH
+/// configuration we did not send -- and that is a different problem from a port
+/// nothing listens on, with a different answer.
+fn describe_early_close(conn: &quiche::Connection) -> AetherError {
+    let stated = |label: &str, e: &quiche::ConnectionError| {
+        format!(
+            "{label} closed it: code=0x{:x} ({}){}",
+            e.error_code,
+            name_close_code(e.error_code),
+            match String::from_utf8_lossy(&e.reason).trim() {
+                "" => String::new(),
+                reason => format!(" reason={reason}"),
+            }
+        )
+    };
+
+    let peer = conn.peer_error();
+    let local = conn.local_error();
+
+    // ECH is worth its own kind: it is the one close here that names its own
+    // remedy, and the layer above can act on it rather than alternate.
+    if peer.iter().chain(local.iter()).any(|e| is_ech_required(e)) {
+        return AetherError::Ech(
+            "the gateway requires an ECH configuration and refused the one sent (TLS alert 121);              set AETHER_ECH=auto, or use the H2 framing"
+                .into(),
+        );
+    }
+
+    let said = peer
+        .map(|e| stated("the gateway", e))
+        .or_else(|| local.map(|e| stated("this end", e)))
+        .unwrap_or_else(|| "neither end said why".to_string());
+
+    AetherError::Masque(format!("closed before the tunnel carried anything; {said}"))
+}
+
+fn is_ech_required(e: &quiche::ConnectionError) -> bool {
+    !e.is_app && e.error_code == CRYPTO_ERROR_BASE + TLS_ALERT_ECH_REQUIRED
+}
+
+/// QUIC puts a TLS alert in the low byte of a CRYPTO_ERROR.
+const CRYPTO_ERROR_BASE: u64 = 0x100;
+const TLS_ALERT_ECH_REQUIRED: u64 = 121;
+
+/// A close code as something a person can act on.
+fn name_close_code(code: u64) -> &'static str {
+    match code {
+        0x00 => "no error",
+        0x01 => "internal error",
+        0x02 => "connection refused",
+        0x03 => "flow control error",
+        0x07 => "frame encoding error",
+        0x0a => "protocol violation",
+        0x0d => "crypto buffer exceeded",
+        0x100..=0x1ff => match code - CRYPTO_ERROR_BASE {
+            40 => "tls: handshake failure",
+            42 => "tls: bad certificate",
+            48 => "tls: unknown certificate authority",
+            50 => "tls: decode error",
+            70 => "tls: protocol version",
+            80 => "tls: internal error",
+            112 => "tls: unrecognised name",
+            120 => "tls: no application protocol",
+            121 => "tls: ECH required",
+            _ => "tls alert",
+        },
+        _ => "unnamed",
+    }
+}
+
 pub fn default_authority() -> &'static str {
     "cloudflareaccess.com"
 }
@@ -810,7 +918,7 @@ pub async fn verify_masque(p: &VerifyParams) -> Result<Duration> {
         cert_pem: &p.cert_pem,
         key_pem: &p.key_pem,
         pin_endpoint: true,
-        expected_pins: consts::MASQUE_PINS,
+        expected_pins: &consts::masque_pins(),
     })?;
 
     let scid_bytes = random_scid();

@@ -23,6 +23,98 @@ const REP_GENERAL: u8 = 0x01;
 const REP_NOT_ALLOWED: u8 = 0x02;
 const REP_NOT_SUPPORTED: u8 = 0x07;
 
+const AUTH_NONE: u8 = 0x00;
+const AUTH_USERPASS: u8 = 0x02;
+const AUTH_UNACCEPTABLE: u8 = 0xFF;
+/// The username/password sub-negotiation carries its own version (RFC 1929).
+const AUTH_SUBVER: u8 = 0x01;
+
+/// Who may use the proxy.
+///
+/// Only interesting once the listener leaves loopback. A loopback port is
+/// reachable by this device and nothing else, so the question of who is
+/// calling does not arise; a port on the local network is reachable by every
+/// machine on it.
+#[derive(Clone, Debug, Default)]
+pub struct Access {
+    /// Demanded of every client. `None` accepts anyone who reaches the port.
+    pub credentials: Option<Credentials>,
+}
+
+#[derive(Clone, Debug)]
+pub struct Credentials {
+    pub username: String,
+    pub password: String,
+}
+
+impl Credentials {
+    /// Compares without returning early on the first wrong byte.
+    ///
+    /// The client controls how long it takes to be told no, and a comparison
+    /// that stops at the first mismatch tells them where it was. Over a LAN
+    /// the timing is measurable.
+    fn matches(&self, username: &[u8], password: &[u8]) -> bool {
+        constant_time_eq(self.username.as_bytes(), username)
+            & constant_time_eq(self.password.as_bytes(), password)
+    }
+}
+
+fn constant_time_eq(a: &[u8], b: &[u8]) -> bool {
+    if a.len() != b.len() {
+        return false;
+    }
+    let mut diff = 0u8;
+    for (x, y) in a.iter().zip(b.iter()) {
+        diff |= x ^ y;
+    }
+    diff == 0
+}
+
+/// Set once per session rather than passed down: `serve` has nine callers
+/// across the tunnels, and none of them has an opinion about access.
+static ACCESS: std::sync::RwLock<Option<Access>> = std::sync::RwLock::new(None);
+
+pub fn configure_access(access: Access) {
+    if let Ok(mut slot) = ACCESS.write() {
+        *slot = Some(access);
+    }
+}
+
+fn access() -> Access {
+    ACCESS
+        .read()
+        .ok()
+        .and_then(|slot| slot.clone())
+        .unwrap_or_default()
+}
+
+/// Whether a client that reached the port is allowed to be there.
+///
+/// A loopback listener answers anyone, because only this device could have
+/// dialled it. A listener on any other address is on a network, and a phone on
+/// mobile data holds a routable address -- so without this, sharing to the LAN
+/// would also be sharing to whatever else can route to the phone.
+fn allowed_source(listen: IpAddr, peer: IpAddr) -> bool {
+    listen.is_loopback() || is_local_network(peer)
+}
+
+fn is_local_network(ip: IpAddr) -> bool {
+    match ip {
+        IpAddr::V4(v4) => v4.is_loopback() || v4.is_private() || v4.is_link_local(),
+        IpAddr::V6(v6) => {
+            if v6.is_loopback() {
+                return true;
+            }
+            if let Some(mapped) = v6.to_ipv4_mapped() {
+                return mapped.is_loopback() || mapped.is_private() || mapped.is_link_local();
+            }
+            let first = v6.segments()[0];
+            // fc00::/7 unique-local and fe80::/10 link-local.
+            (first & 0xfe00) == 0xfc00 || (first & 0xffc0) == 0xfe80
+        }
+    }
+}
+
 #[derive(Debug)]
 enum Target {
     Ip(IpAddr),
@@ -117,8 +209,31 @@ pub(crate) fn proxy_connect_succeeded(head: &[u8]) -> Option<bool> {
     Some((200..300).contains(&status))
 }
 
-pub(crate) fn warn_if_world_reachable(kind: &str, listen: SocketAddr) {
-    if listen.ip().is_loopback() {
+/// Warns when a listener is reachable from off this machine and unguarded.
+///
+/// Upstream warns on the bind address alone, because upstream has nothing but
+/// the bind address: every client is accepted. This fork can require a
+async fn read_request(sock: &mut TcpStream, access: &Access) -> Result<(u8, Target, u16)> {
+    handshake(sock, access).await?;
+
+    let mut head = [0u8; 4];
+    sock.read_exact(&mut head).await?;
+    if head[0] != VER {
+        return Err(AetherError::Other("bad socks version".into()));
+    }
+
+    let (target, port) = read_target(sock, head[3]).await?;
+    Ok((head[1], target, port))
+}
+
+/// password and filters by source, and sharing the tunnel on purpose is a
+/// feature here rather than an accident -- so a warning that fired on a
+/// deliberate, password-protected share would be crying wolf at the one user
+/// who did the careful thing.
+///
+/// It still fires for a wide bind with no password, which is genuinely open.
+pub(crate) fn warn_if_world_reachable(kind: &str, listen: SocketAddr, guarded: bool) {
+    if listen.ip().is_loopback() || guarded {
         return;
     }
     log::warn!(
@@ -158,14 +273,35 @@ fn bind_hint(error: &std::io::Error) -> &'static str {
 
 pub async fn serve(listener: TcpListener, stack: StackHandle) -> Result<()> {
     let listen = listener.local_addr()?;
-    log::info!("[+] socks5 server listening on {listen}");
-    warn_if_world_reachable("socks5", listen);
+    let access = access();
     let bind_ip = listen.ip();
+    log::info!(
+        "[+] socks5 server listening on {listen} ({}, {})",
+        if bind_ip.is_loopback() {
+            "this device only"
+        } else {
+            "local network"
+        },
+        if access.credentials.is_some() {
+            "password required"
+        } else {
+            "no password"
+        },
+    );
+    warn_if_world_reachable("socks5", listen, access.credentials.is_some());
 
     accept_clients(listener, "socks5", client_limit(), move |sock, peer| {
         let stack = stack.clone();
+        let access = access.clone();
         async move {
-            if let Err(e) = handle_client(sock, stack, bind_ip).await {
+            // Before the handshake, not after it. A client from somewhere this
+            // listener was never meant to be reachable from is not a client
+            // with the wrong password, and it should not get to send one.
+            if !allowed_source(bind_ip, peer.ip()) {
+                log::warn!("socks5 refused {peer}: not on this device's local network");
+                return;
+            }
+            if let Err(e) = handle_client(sock, stack, bind_ip, &access).await {
                 log::debug!("socks client {peer} ended: {e}");
             }
         }
@@ -313,12 +449,21 @@ pub fn accept_backoff(error: &std::io::Error) -> Option<std::time::Duration> {
     }
 }
 
-async fn handle_client(mut sock: TcpStream, stack: StackHandle, bind_ip: IpAddr) -> Result<()> {
-    let (cmd, target, port) = tokio::time::timeout(HANDSHAKE_TIMEOUT, read_request(&mut sock))
-        .await
-        .map_err(|_| {
-            AetherError::Other("the client did not finish the socks5 handshake in time".into())
-        })??;
+async fn handle_client(
+    mut sock: TcpStream,
+    stack: StackHandle,
+    bind_ip: IpAddr,
+    access: &Access,
+) -> Result<()> {
+    // Bounded, because everything before this point costs a client slot and a
+    // peer that opens connections and never finishes a handshake would hold
+    // them all.
+    let (cmd, target, port) =
+        tokio::time::timeout(HANDSHAKE_TIMEOUT, read_request(&mut sock, access))
+            .await
+            .map_err(|_| {
+                AetherError::Other("the client did not finish the socks5 handshake in time".into())
+            })??;
 
     match cmd {
         CMD_CONNECT => handle_connect(sock, stack, target, port).await,
@@ -330,20 +475,7 @@ async fn handle_client(mut sock: TcpStream, stack: StackHandle, bind_ip: IpAddr)
     }
 }
 
-async fn read_request(sock: &mut TcpStream) -> Result<(u8, Target, u16)> {
-    handshake(sock).await?;
-
-    let mut head = [0u8; 4];
-    sock.read_exact(&mut head).await?;
-    if head[0] != VER {
-        return Err(AetherError::Other("bad socks version".into()));
-    }
-
-    let (target, port) = read_target(sock, head[3]).await?;
-    Ok((head[1], target, port))
-}
-
-async fn handshake(sock: &mut TcpStream) -> Result<()> {
+async fn handshake(sock: &mut TcpStream, access: &Access) -> Result<()> {
     let mut prefix = [0u8; 2];
     sock.read_exact(&mut prefix).await?;
     if prefix[0] != VER {
@@ -352,7 +484,44 @@ async fn handshake(sock: &mut TcpStream) -> Result<()> {
     let nmethods = prefix[1] as usize;
     let mut methods = vec![0u8; nmethods];
     sock.read_exact(&mut methods).await?;
-    sock.write_all(&[VER, 0x00]).await?;
+
+    let Some(credentials) = access.credentials.as_ref() else {
+        sock.write_all(&[VER, AUTH_NONE]).await?;
+        return Ok(());
+    };
+
+    if !methods.contains(&AUTH_USERPASS) {
+        // Answered rather than dropped: a client that only offered "none" gets
+        // to say so in its own error instead of reporting a dead port.
+        sock.write_all(&[VER, AUTH_UNACCEPTABLE]).await?;
+        return Err(AetherError::Other(
+            "client offered no password method".into(),
+        ));
+    }
+    sock.write_all(&[VER, AUTH_USERPASS]).await?;
+    authenticate(sock, credentials).await
+}
+
+/// The username/password exchange of RFC 1929.
+async fn authenticate(sock: &mut TcpStream, credentials: &Credentials) -> Result<()> {
+    let mut head = [0u8; 2];
+    sock.read_exact(&mut head).await?;
+    if head[0] != AUTH_SUBVER {
+        return Err(AetherError::Other("bad auth version".into()));
+    }
+    let mut username = vec![0u8; head[1] as usize];
+    sock.read_exact(&mut username).await?;
+
+    let mut plen = [0u8; 1];
+    sock.read_exact(&mut plen).await?;
+    let mut password = vec![0u8; plen[0] as usize];
+    sock.read_exact(&mut password).await?;
+
+    if !credentials.matches(&username, &password) {
+        sock.write_all(&[AUTH_SUBVER, 0x01]).await?;
+        return Err(AetherError::Other("bad socks credentials".into()));
+    }
+    sock.write_all(&[AUTH_SUBVER, 0x00]).await?;
     Ok(())
 }
 
@@ -785,7 +954,7 @@ where
 {
     let listen = listener.local_addr()?;
     log::info!("[+] {kind} listening on {listen}");
-    warn_if_world_reachable(kind, listen);
+    warn_if_world_reachable(kind, listen, false);
 
     accept_clients(listener, kind, client_limit(), move |sock, peer| {
         let connect = connect.clone();
@@ -804,11 +973,16 @@ where
     Fut: Future<Output = std::io::Result<S>>,
     S: AsyncRead + AsyncWrite + Send + Unpin + 'static,
 {
-    let (cmd, target, port) = tokio::time::timeout(HANDSHAKE_TIMEOUT, read_request(&mut sock))
-        .await
-        .map_err(|_| {
-            AetherError::Other("the client did not finish the socks5 handshake in time".into())
-        })??;
+    // No password on this one: it is not a listener the user shares, it is how
+    // one part of the engine reaches another.
+    let (cmd, target, port) = tokio::time::timeout(
+        HANDSHAKE_TIMEOUT,
+        read_request(&mut sock, &Access::default()),
+    )
+    .await
+    .map_err(|_| {
+        AetherError::Other("the client did not finish the socks5 handshake in time".into())
+    })??;
 
     if cmd != CMD_CONNECT {
         let _ = reply(&mut sock, REP_NOT_SUPPORTED).await;
@@ -1577,6 +1751,84 @@ mod accept_tests {
 mod tests {
     use super::*;
 
+    fn creds() -> Credentials {
+        Credentials {
+            username: "phone".into(),
+            password: "correct horse".into(),
+        }
+    }
+
+    #[test]
+    fn a_loopback_listener_answers_this_device_and_nothing_else_can_reach_it() {
+        let loopback: IpAddr = "127.0.0.1".parse().unwrap();
+
+        // Not a policy decision: nothing off this device can route to it, so
+        // filtering here would only reject the local clients it exists for.
+        assert!(allowed_source(loopback, "127.0.0.1".parse().unwrap()));
+    }
+
+    #[test]
+    fn a_shared_listener_answers_the_local_network_only() {
+        let shared: IpAddr = "0.0.0.0".parse().unwrap();
+
+        for peer in ["192.168.1.20", "10.0.0.5", "172.16.4.9", "169.254.7.7"] {
+            assert!(
+                allowed_source(shared, peer.parse().unwrap()),
+                "{peer} is on a local network"
+            );
+        }
+
+        // The phone holds a routable address on mobile data, so binding to
+        // every interface exposes the proxy to more than the Wi-Fi it was
+        // shared with. This is the check that keeps that from happening.
+        for peer in ["8.8.8.8", "203.0.113.9", "172.32.0.1"] {
+            assert!(
+                !allowed_source(shared, peer.parse().unwrap()),
+                "{peer} is not on a local network"
+            );
+        }
+    }
+
+    #[test]
+    fn ipv6_local_ranges_are_recognised_including_mapped_v4() {
+        assert!(is_local_network("::1".parse().unwrap()));
+        assert!(is_local_network("fd00::1".parse().unwrap()));
+        assert!(is_local_network("fe80::1".parse().unwrap()));
+        assert!(is_local_network("::ffff:192.168.1.5".parse().unwrap()));
+
+        assert!(!is_local_network("2606:4700::1111".parse().unwrap()));
+        assert!(!is_local_network("::ffff:8.8.8.8".parse().unwrap()));
+    }
+
+    #[test]
+    fn credentials_accept_only_the_exact_pair() {
+        let creds = creds();
+
+        assert!(creds.matches(b"phone", b"correct horse"));
+        assert!(!creds.matches(b"phone", b"correct horsey"));
+        assert!(!creds.matches(b"phone", b"correct hors"));
+        assert!(!creds.matches(b"Phone", b"correct horse"));
+        assert!(!creds.matches(b"", b""));
+    }
+
+    #[test]
+    fn comparing_reads_every_byte_of_an_equal_length_guess() {
+        // A comparison that stopped at the first wrong byte would tell a
+        // client on the LAN how much of the password it had right, one
+        // measurable round trip at a time.
+        assert!(!constant_time_eq(b"aaaaaaaa", b"baaaaaaa"));
+        assert!(!constant_time_eq(b"aaaaaaaa", b"aaaaaaab"));
+        assert!(constant_time_eq(b"aaaaaaaa", b"aaaaaaaa"));
+        assert!(!constant_time_eq(b"short", b"longer input"));
+    }
+
+    #[test]
+    fn access_defaults_to_demanding_nothing() {
+        // What every existing caller got before there was a choice: the
+        // loopback listener has no password and must keep working without one.
+        assert!(Access::default().credentials.is_none());
+    }
+
     fn parse_resolvers(raw: &str) -> Vec<SocketAddr> {
         let mut servers: Vec<SocketAddr> = Vec::new();
         for token in raw.split([',', ' ', ';']) {
@@ -1827,7 +2079,11 @@ const HTTP_HEAD_LIMIT: usize = 16 * 1024;
 pub async fn serve_http(listener: TcpListener, stack: StackHandle) -> Result<()> {
     let listen = listener.local_addr()?;
     log::info!("[+] http proxy listening on {listen}");
-    warn_if_world_reachable("http proxy", listen);
+    // Never guarded, unlike socks5 above: the http proxy checks neither a
+    // password nor the source address. Android never starts it -- it is gated
+    // behind AETHER_HTTP_PROXY, which the bridge does not set -- so this warns
+    // for the desktop builds that can.
+    warn_if_world_reachable("http proxy", listen, false);
 
     accept_clients(listener, "http proxy", client_limit(), move |sock, peer| {
         let stack = stack.clone();

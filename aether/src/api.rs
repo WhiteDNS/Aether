@@ -438,56 +438,6 @@ pub async fn scan(identity: &Identity, request: &ScanRequest, cancel: &Cancel) -
     }
 }
 
-/// Ranks the gateways that answer, rather than returning only the best one.
-///
-/// [`scan`] answers the question a connection asks. A client offering an
-/// endpoint picker asks a different one -- show me what is reachable and how
-/// fast each is -- and cannot get it from a single result.
-///
-/// MASQUE only: WireGuard's prober selects rather than ranks, and returning one
-/// entry dressed as a list would be a worse answer than saying so.
-pub async fn scan_ranked(
-    identity: &Identity,
-    request: &ScanRequest,
-    limit: usize,
-    cancel: &Cancel,
-) -> Result<Vec<Endpoint>> {
-    if !matches!(request.transport, Transport::Masque) {
-        return Err(AetherError::Other(
-            "ranked scanning is available for MASQUE only".into(),
-        ));
-    }
-    let probe = prober::MasqueProbe {
-        sni: consts::CONNECT_SNI.to_string(),
-        authority: quic::default_authority().to_string(),
-        path: quic::default_path().to_string(),
-        cert_pem: Arc::from(identity.cert_pem.clone()),
-        key_pem: Arc::from(identity.key_pem.clone()),
-        ech_config_list: request.ech_config_list.clone().map(Arc::from),
-        noize: request.noize.clone(),
-        ports: request.ports.clone(),
-        ip: request.ip,
-        local_ipv4: crate::parse_local_v4(&identity.ipv4),
-    };
-    let mode = prober::ScanMode::parse(&request.mode);
-    // The prober takes a flag of its own so an in-process caller can stop it
-    // between probes; here the cancel guard drops the whole scan instead.
-    let cooperative = std::sync::atomic::AtomicBool::new(false);
-    let found = guard(
-        cancel,
-        prober::scan_gateways(&probe, mode, limit, &cooperative),
-    )
-    .await?;
-    Ok(found
-        .into_iter()
-        .map(|result| Endpoint {
-            ip: result.ip,
-            port: result.port,
-            rtt_ms: result.rtt.as_millis() as u64,
-        })
-        .collect())
-}
-
 fn wg_local_v4(identity: &Identity) -> Result<Ipv4Addr> {
     identity
         .ipv4
