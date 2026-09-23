@@ -253,6 +253,54 @@ impl IdentitySummary {
     }
 }
 
+/// Ranks reachable MASQUE gateways without connecting to one.
+///
+/// Kept because the desktop client's endpoint scanner is built on it: it runs
+/// the binary with `--scan-only` and reads the JSON this produces. Losing it in
+/// a tree swap would take that feature out with no error anywhere -- the scan
+/// would simply stop being offered.
+pub async fn scan_ranked(
+    identity: &Identity,
+    request: &ScanRequest,
+    limit: usize,
+    cancel: &Cancel,
+) -> Result<Vec<Endpoint>> {
+    if !matches!(request.transport, Transport::Masque) {
+        return Err(AetherError::Other(
+            "ranked scanning is available for MASQUE only".into(),
+        ));
+    }
+    let probe = prober::MasqueProbe {
+        sni: consts::CONNECT_SNI.to_string(),
+        authority: quic::default_authority().to_string(),
+        path: quic::default_path().to_string(),
+        cert_pem: Arc::from(identity.cert_pem.clone()),
+        key_pem: Arc::from(identity.key_pem.clone()),
+        ech_config_list: request.ech_config_list.clone().map(Arc::from),
+        noize: request.noize.clone(),
+        ports: request.ports.clone(),
+        ip: request.ip,
+        local_ipv4: crate::parse_local_v4(&identity.ipv4),
+    };
+    let mode = prober::ScanMode::parse(&request.mode);
+    // The prober takes a flag of its own so an in-process caller can stop it
+    // between probes; here the cancel guard drops the whole scan instead.
+    let cooperative = std::sync::atomic::AtomicBool::new(false);
+    let found = guard(
+        cancel,
+        prober::scan_gateways(&probe, mode, limit, &cooperative),
+    )
+    .await?;
+    Ok(found
+        .into_iter()
+        .map(|result| Endpoint {
+            ip: result.ip,
+            port: result.port,
+            rtt_ms: result.rtt.as_millis() as u64,
+        })
+        .collect())
+}
+
 pub fn identity_path(base: &str, transport: Transport, team: Option<&str>) -> String {
     match team {
         Some(team) => crate::derive_sibling_path(base, &format!("team-{team}")),

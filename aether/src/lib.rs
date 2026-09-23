@@ -2784,6 +2784,26 @@ async fn select_peer(identity: &account::Identity, protocol: Protocol) -> Result
 
     match protocol {
         Protocol::Masque | Protocol::MasqueInMasque => {
+            // The address Cloudflare assigned this device, before hunting for
+            // one. `select_embedded_peer` has done this since the assigned
+            // endpoint was found to be the answer the server had been giving
+            // all along -- but that is the path the Android client calls into,
+            // and the desktop client runs this binary, so it went on
+            // brute-forcing a hard-coded pool while holding the answer.
+            //
+            // Both candidates, and in order: the endpoint stored locally, then
+            // the one on a freshly fetched device record. Cloudflare moves a
+            // device between edges, so the stored one goes stale -- measured on
+            // one account minutes apart, registration said 162.159.192.x and the
+            // device record said 162.159.198.x.
+            for peer in assigned_masque_peers(identity).await {
+                if quick_verify_masque_peer(identity, peer).await {
+                    log::info!("[+] the endpoint Cloudflare assigned this device answered: {peer}");
+                    return Ok(peer);
+                }
+                log::info!("[-] the assigned endpoint {peer} did not answer; hunting instead");
+            }
+
             log::info!("[*] hunting for a working MASQUE gateway (deep connect-ip verification)");
             let mode = prober::ScanMode::parse(&mode_str);
             let probe = prober::MasqueProbe {
@@ -3186,8 +3206,10 @@ async fn run_report(command: ReportCommand) -> Result<()> {
 
 async fn report_answer(command: ReportCommand) -> Result<serde_json::Value> {
     let base_config = std::env::var("AETHER_CONFIG").unwrap_or_else(|_| DEFAULT_CONFIG.to_string());
-    let config_path = masque_config_path(&base_config);
-    let identity = load_or_provision_masque(&config_path).await?;
+    // Through the identity store, as every other caller now does. This asked
+    // for a bare path, which was the whole interface before the store existed.
+    let identity =
+        load_or_provision_masque(&identity_site(&base_config, identity::Slot::Masque)).await?;
 
     match command {
         ReportCommand::Scan { limit } => {
@@ -3238,6 +3260,28 @@ async fn hunt_masque_peer(
     mode_str: &str,
     ip: prober::IpScan,
 ) -> Result<SocketAddr> {
+    // The address Cloudflare assigned this device, before hunting for one.
+    //
+    // `select_embedded_peer` has done this since the assigned endpoint turned
+    // out to be the answer the server had been giving all along -- but that is
+    // the path the Android client calls into, and the desktop client runs this
+    // binary, which arrives here. So it went on brute-forcing a hard-coded pool
+    // while holding the answer: 2,572 candidates against one address the
+    // registration response had already named.
+    //
+    // Both candidates, in order: the endpoint stored locally, then the one on a
+    // freshly fetched device record. Cloudflare moves a device between edges,
+    // so the stored one goes stale -- measured on one account minutes apart,
+    // registration said 162.159.192.x while the device record said
+    // 162.159.198.x, and only the second answered.
+    for peer in assigned_masque_peers(identity).await {
+        if quick_verify_masque_peer(identity, peer).await {
+            log::info!("[+] the endpoint Cloudflare assigned this device answered: {peer}");
+            return Ok(peer);
+        }
+        log::info!("[-] the assigned endpoint {peer} did not answer; hunting instead");
+    }
+
     log::info!(
         "[*] hunting for a working MASQUE gateway (deep connect-ip + data-plane verification)"
     );
