@@ -80,6 +80,10 @@ Report gateways without connecting (prints one JSON object on stdout):
   --test-endpoint <ip:port>
                            validate one gateway with a real authenticated handshake
 
+Back up the identity without connecting (prints one JSON object on stdout):
+  --export-identity        every account this install holds, in the payload field
+  --import-identity <file> restore a file written by --export-identity
+
 Scan mode:
   --scan <mode>            turbo | balanced | thorough | stealth | ironclad
   --turbo                  stop at the first candidate that answers
@@ -426,6 +430,8 @@ pub fn parse_args(args: Vec<String>) -> crate::error::Result<Parsed> {
             "--scan-only" => set("AETHER_SCAN_ONLY", "1"),
             "--scan-limit" => set("AETHER_SCAN_LIMIT", next_value!()),
             "--test-endpoint" => set("AETHER_TEST_ENDPOINT", next_value!()),
+            "--export-identity" => set("AETHER_EXPORT_IDENTITY", "1"),
+            "--import-identity" => set("AETHER_IMPORT_IDENTITY", next_value!()),
 
             "--config" => set("AETHER_CONFIG", next_value!()),
             "--wg-config" => set("AETHER_WG_CONFIG", next_value!()),

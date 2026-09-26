@@ -3194,9 +3194,19 @@ enum ReportCommand {
     Scan { limit: usize },
     /// Validate one gateway with a real authenticated handshake.
     Test { peer: Option<SocketAddr> },
+    /// Every account this install holds, in the backup format.
+    ExportIdentity,
+    /// Restore a backup from this file.
+    ImportIdentity { path: String },
 }
 
 fn report_command() -> Option<ReportCommand> {
+    if let Ok(path) = std::env::var("AETHER_IMPORT_IDENTITY") {
+        return Some(ReportCommand::ImportIdentity { path });
+    }
+    if std::env::var("AETHER_EXPORT_IDENTITY").is_ok() {
+        return Some(ReportCommand::ExportIdentity);
+    }
     if let Ok(value) = std::env::var("AETHER_TEST_ENDPOINT") {
         // A bad address is still answered in the reporting shape rather than
         // falling through into a connection attempt.
@@ -3229,6 +3239,23 @@ async fn run_report(command: ReportCommand) -> Result<()> {
 
 async fn report_answer(command: ReportCommand) -> Result<serde_json::Value> {
     let base_config = std::env::var("AETHER_CONFIG").unwrap_or_else(|_| DEFAULT_CONFIG.to_string());
+
+    // Answered before anything below can provision: a backup that registered a
+    // device to have something to back up would spend the very registration it
+    // exists to save.
+    match &command {
+        ReportCommand::ExportIdentity => {
+            return Ok(serde_json::json!({ "ok": true, "payload": export_identity(&base_config)? }));
+        }
+        ReportCommand::ImportIdentity { path } => {
+            let payload = std::fs::read_to_string(path).map_err(|e| {
+                AetherError::Other(format!("cannot read the identity file: {e}"))
+            })?;
+            import_identity(&base_config, &payload)?;
+            return Ok(serde_json::json!({ "ok": true }));
+        }
+        _ => {}
+    }
     // Through the identity store, as every other caller now does. This asked
     // for a bare path, which was the whole interface before the store existed.
     let identity =
@@ -3274,6 +3301,10 @@ async fn report_answer(command: ReportCommand) -> Result<serde_json::Value> {
                 "peer": peer.to_string(),
                 "rttMs": started.elapsed().as_millis() as u64,
             }))
+        }
+        // Both answered above, before an identity could be provisioned.
+        ReportCommand::ExportIdentity | ReportCommand::ImportIdentity { .. } => {
+            Err(AetherError::Other("identity commands are answered first".into()))
         }
     }
 }
