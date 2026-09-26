@@ -46,9 +46,8 @@ impl FragmentConfig {
         let size_min = size_min.max(1) as usize;
         let size_max = (size_max.max(size_min as u64)) as usize;
 
-        let sni_split = std::env::var("AETHER_MASQUE_H2_FRAGMENT_SNI")
-            .map(|v| is_truthy(&v))
-            .unwrap_or(true);
+        let sni_split =
+            sni_split_setting(std::env::var("AETHER_MASQUE_H2_FRAGMENT_SNI").ok().as_deref());
 
         Self {
             enabled,
@@ -151,6 +150,12 @@ pub fn sni_host_range(buf: &[u8]) -> Option<(usize, usize)> {
     }
 
     None
+}
+
+/// On unless switched off: the split inside the server name is what asking
+/// for fragmentation is for.
+fn sni_split_setting(value: Option<&str>) -> bool {
+    value.map(is_truthy).unwrap_or(true)
 }
 
 pub struct FragmentingStream<S> {
@@ -305,5 +310,33 @@ mod tests {
     #[test]
     fn targeted_splitting_is_on_by_default_once_fragmenting_is_asked_for() {
         assert!(!FragmentConfig::disabled().sni_split);
+    }
+
+    #[test]
+    fn the_server_name_split_is_on_unless_switched_off() {
+        assert!(sni_split_setting(None));
+        assert!(sni_split_setting(Some("1")));
+        assert!(!sni_split_setting(Some("0")));
+    }
+
+    #[tokio::test]
+    async fn the_first_write_of_a_client_hello_ends_inside_the_server_name() {
+        use tokio::io::AsyncWriteExt;
+
+        let hello = client_hello("api.cloudflareclient.com");
+        let (start, end) = sni_host_range(&hello).expect("the name is in there");
+        // Chunks far smaller than the distance to the name, so a write that
+        // ignored it could not end inside it by chance.
+        let cfg = FragmentConfig {
+            enabled: true,
+            size_min: 16,
+            size_max: 32,
+            delay_min_ms: 0,
+            delay_max_ms: 0,
+            sni_split: true,
+        };
+        let mut stream = FragmentingStream::new(Vec::new(), cfg);
+        let written = stream.write(&hello).await.unwrap();
+        assert!(start < written && written < end, "{start} < {written} < {end}");
     }
 }

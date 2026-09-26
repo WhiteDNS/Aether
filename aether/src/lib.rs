@@ -4979,6 +4979,13 @@ impl Drop for TaskGuard {
     }
 }
 
+/// Points replies at whichever address last sent, and returns the one it
+/// moved from, if it moved.
+fn follow_sender(known: &mut Option<SocketAddr>, from: SocketAddr) -> Option<SocketAddr> {
+    let previous = known.replace(from);
+    previous.filter(|previous| *previous != from)
+}
+
 async fn spawn_udp_forwarder(
     outer: &netstack::StackHandle,
     remote: SocketAddr,
@@ -5001,14 +5008,8 @@ async fn spawn_udp_forwarder(
         // used dropped everything after the move and killed the tunnel, so
         // replies follow whichever port it last sent from.
         while let Ok((n, from)) = up_sock.recv_from(&mut buf).await {
-            {
-                let mut known = up_peer.lock().await;
-                if *known != Some(from) {
-                    if let Some(previous) = *known {
-                        log::debug!("inner udp forwarder follows {from} now, was {previous}");
-                    }
-                    *known = Some(from);
-                }
+            if let Some(previous) = follow_sender(&mut *up_peer.lock().await, from) {
+                log::debug!("inner udp forwarder follows {from} now, was {previous}");
             }
             if udp_tx.send_to(remote, buf[..n].to_vec()).await.is_err() {
                 break;
@@ -7248,5 +7249,23 @@ mod migration_tests {
         drop(rx);
 
         assert!(!migrate_running_tunnel());
+    }
+}
+
+#[cfg(test)]
+mod udp_forwarder_tests {
+    use super::follow_sender;
+    use std::net::SocketAddr;
+
+    #[test]
+    fn replies_follow_the_inner_engine_when_it_rebinds() {
+        let first: SocketAddr = "127.0.0.1:50000".parse().unwrap();
+        let rebound: SocketAddr = "127.0.0.1:50001".parse().unwrap();
+        let mut known = None;
+
+        assert_eq!(follow_sender(&mut known, first), None);
+        assert_eq!(follow_sender(&mut known, first), None);
+        assert_eq!(follow_sender(&mut known, rebound), Some(first));
+        assert_eq!(known, Some(rebound));
     }
 }
