@@ -39,6 +39,16 @@ working from an Iranian network the scan had reported as empty. The edge ranges 
 the dedicated ones and sampled more thinly, so a network where the dedicated ranges answer pays
 nothing for them.
 
+## Upstream commits carried from 2.1.0
+
+Taken ahead of a rebase onto 2.1.0: `dc797fc` (the HTTP/2 data-plane probe is resent), `2509da0`
+(WireGuard's firewall and gfw profiles), `5556752` (the ClientHello split inside the server name,
+and a split TLS 1.3 registration fingerprint), and `3788f4b` (WARP-in-WARP follows its inner
+tunnel's port). Psiphon and Tor inside the core, exit-country checks, statistics, the verified scan
+mode and the ring of remembered gateways are not carried: the WhiteAesther client runs Psiphon and
+Tor itself and keeps its own record of how an endpoint was proven. The socket mark (`--mark`) was
+already here and stays.
+
 ## What it no longer needs to add
 
 Earlier tags of this fork (`v1.5.0-whiteaesther.*`) carried an embedded API — `main.rs` moved to
