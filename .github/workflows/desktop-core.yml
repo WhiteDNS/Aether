@@ -1,0 +1,33 @@
+name: desktop core checks
+on:
+  pull_request:
+  workflow_dispatch:
+permissions:
+  contents: read
+jobs:
+  native:
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [windows-latest, macos-latest, macos-15-intel, ubuntu-22.04, ubuntu-22.04-arm]
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 60
+    steps:
+      - uses: actions/checkout@v7
+      - uses: dtolnay/rust-toolchain@1.98.0
+        with:
+          components: rustfmt, clippy
+      - uses: ilammy/setup-nasm@v1
+        if: runner.os == 'Windows'
+      - run: sudo apt-get update && sudo apt-get install -y cmake ninja-build clang perl pkg-config
+        if: runner.os == 'Linux'
+      - run: cargo fmt --manifest-path "aether/Cargo.toml" -- --check
+      - run: cargo test --locked --manifest-path "aether/Cargo.toml" --lib -- --test-threads=1
+      - run: cargo clippy --locked --manifest-path "aether/Cargo.toml" --all-targets
+      - run: cargo build --release --locked --manifest-path "aether/Cargo.toml"
+      - name: Check offline desktop contract
+        shell: bash
+        run: |
+          suffix=""; if [[ "${RUNNER_OS}" == "Windows" ]]; then suffix=".exe"; fi
+          "aether/target/release/aether${suffix}" --desktop-capabilities
+          "aether/target/release/aether${suffix}" --check-options --tls-groups X25519:P-256:P-384 --tls-ciphers ECDHE-RSA-AES128-GCM-SHA256
