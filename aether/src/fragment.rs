@@ -46,8 +46,11 @@ impl FragmentConfig {
         let size_min = size_min.max(1) as usize;
         let size_max = (size_max.max(size_min as u64)) as usize;
 
-        let sni_split =
-            sni_split_setting(std::env::var("AETHER_MASQUE_H2_FRAGMENT_SNI").ok().as_deref());
+        let sni_split = sni_split_setting(
+            std::env::var("AETHER_MASQUE_H2_FRAGMENT_SNI")
+                .ok()
+                .as_deref(),
+        );
 
         Self {
             enabled,
@@ -82,7 +85,7 @@ impl FragmentConfig {
     }
 }
 
-fn is_truthy(v: &str) -> bool {
+pub(crate) fn is_truthy(v: &str) -> bool {
     matches!(
         v.trim().to_lowercase().as_str(),
         "1" | "true" | "yes" | "on"
@@ -164,6 +167,9 @@ pub struct FragmentingStream<S> {
     fragmenting: bool,
     first_write: bool,
     pending_delay: Option<Pin<Box<tokio::time::Sleep>>>,
+    hello_shape: Option<crate::hello_shape::HelloShape>,
+    pending_hello: Option<crate::hello_shape::PendingHello>,
+    hello_input: Option<Vec<u8>>,
 }
 
 impl<S> FragmentingStream<S> {
@@ -174,13 +180,31 @@ impl<S> FragmentingStream<S> {
             cfg,
             first_write: true,
             pending_delay: None,
+            hello_shape: if cfg.enabled {
+                crate::hello_shape::HelloShape::from_env()
+            } else {
+                None
+            },
+            pending_hello: None,
+            hello_input: None,
         }
+    }
+
+    fn poll_hello(&mut self, cx: &mut Context<'_>) -> Poll<io::Result<()>>
+    where
+        S: AsyncWrite + Unpin,
+    {
+        if let Some(pending) = &mut self.pending_hello {
+            std::task::ready!(pending.poll_drain(&mut self.inner, cx))?;
+            self.pending_hello = None;
+        }
+        Poll::Ready(Ok(()))
     }
 }
 
 impl<S> AsyncRead for FragmentingStream<S>
 where
-    S: AsyncRead + Unpin,
+    S: AsyncRead + AsyncWrite + Unpin,
 {
     fn poll_read(
         self: Pin<&mut Self>,
@@ -188,6 +212,7 @@ where
         buf: &mut ReadBuf<'_>,
     ) -> Poll<io::Result<()>> {
         let this = self.get_mut();
+        std::task::ready!(this.poll_hello(cx))?;
         this.fragmenting = false;
         Pin::new(&mut this.inner).poll_read(cx, buf)
     }
@@ -203,6 +228,35 @@ where
         buf: &[u8],
     ) -> Poll<io::Result<usize>> {
         let this = self.get_mut();
+
+        if let Some(original) = &this.hello_input {
+            if buf != original.as_slice() {
+                return Poll::Ready(Err(io::Error::new(
+                    io::ErrorKind::InvalidInput,
+                    "a pending ClientHello must be retried with the same bytes",
+                )));
+            }
+            let accepted = original.len();
+            std::task::ready!(this.poll_hello(cx))?;
+            this.hello_input = None;
+            return Poll::Ready(Ok(accepted));
+        }
+        if this.first_write && !buf.is_empty() {
+            if let Some(shape) = this.hello_shape {
+                this.first_write = false;
+                this.fragmenting = false;
+                if let Some(bytes) = shape.encode(buf) {
+                    this.pending_hello = Some(shape.pending(bytes));
+                    this.hello_input = Some(buf.to_vec());
+                    // BoringSSL BIO flush cannot suspend after an accepted
+                    // write. Keep the BIO in WANT_WRITE until the shaped bytes
+                    // have drained, then acknowledge the original input once.
+                    std::task::ready!(this.poll_hello(cx))?;
+                    this.hello_input = None;
+                    return Poll::Ready(Ok(buf.len()));
+                }
+            }
+        }
 
         if buf.is_empty() || !this.fragmenting {
             return Pin::new(&mut this.inner).poll_write(cx, buf);
@@ -240,11 +294,179 @@ where
     }
 
     fn poll_flush(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<io::Result<()>> {
-        Pin::new(&mut self.get_mut().inner).poll_flush(cx)
+        let this = self.get_mut();
+        std::task::ready!(this.poll_hello(cx))?;
+        Pin::new(&mut this.inner).poll_flush(cx)
     }
 
     fn poll_shutdown(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<io::Result<()>> {
-        Pin::new(&mut self.get_mut().inner).poll_shutdown(cx)
+        let this = self.get_mut();
+        std::task::ready!(this.poll_hello(cx))?;
+        Pin::new(&mut this.inner).poll_shutdown(cx)
+    }
+}
+
+#[cfg(test)]
+mod desktop_split_tests {
+    use super::*;
+
+    fn client_hello(host: &str) -> Vec<u8> {
+        let mut sni = vec![0x00];
+        sni.extend_from_slice(&(host.len() as u16).to_be_bytes());
+        sni.extend_from_slice(host.as_bytes());
+
+        let mut list = (sni.len() as u16).to_be_bytes().to_vec();
+        list.extend_from_slice(&sni);
+
+        let mut ext = vec![0x00, 0x00];
+        ext.extend_from_slice(&(list.len() as u16).to_be_bytes());
+        ext.extend_from_slice(&list);
+
+        let mut body = vec![0x03, 0x03];
+        body.extend_from_slice(&[0u8; 32]);
+        body.push(0x00);
+        body.extend_from_slice(&[0x00, 0x02, 0x13, 0x01]);
+        body.extend_from_slice(&[0x01, 0x00]);
+        body.extend_from_slice(&(ext.len() as u16).to_be_bytes());
+        body.extend_from_slice(&ext);
+
+        let mut handshake = vec![0x01];
+        handshake.extend_from_slice(&(body.len() as u32).to_be_bytes()[1..]);
+        handshake.extend_from_slice(&body);
+
+        let mut record = vec![0x16, 0x03, 0x01];
+        record.extend_from_slice(&(handshake.len() as u16).to_be_bytes());
+        record.extend_from_slice(&handshake);
+        record
+    }
+
+    #[test]
+    fn the_server_name_is_located_inside_a_client_hello() {
+        let host = "api.cloudflareclient.com";
+        let hello = client_hello(host);
+        let (start, end) = sni_host_range(&hello).expect("the name is in there");
+        assert_eq!(&hello[start..end], host.as_bytes());
+    }
+
+    #[test]
+    fn a_split_lands_in_the_middle_of_the_server_name() {
+        let host = "api.cloudflareclient.com";
+        let hello = client_hello(host);
+        let (start, end) = sni_host_range(&hello).expect("the name is in there");
+        let split = start + (end - start) / 2;
+        assert!(split > start && split < end);
+    }
+
+    #[test]
+    fn anything_that_is_not_a_client_hello_is_left_alone() {
+        assert!(sni_host_range(b"").is_none());
+        assert!(sni_host_range(&[0x17, 0x03, 0x03, 0x00, 0x05, 0x01]).is_none());
+        let truncated = &client_hello("example.com")[..20];
+        assert!(sni_host_range(truncated).is_none());
+    }
+
+    #[test]
+    fn targeted_splitting_is_on_by_default_once_fragmenting_is_asked_for() {
+        assert!(!FragmentConfig::disabled().sni_split);
+    }
+
+    #[tokio::test]
+    async fn shaped_hello_survives_short_writes_flush_and_shutdown() {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        for shape in [
+            crate::hello_shape::HelloShape::Records,
+            crate::hello_shape::HelloShape::Compact,
+        ] {
+            let hello = client_hello("consumer-masque.cloudflareclient.com");
+            let mut expected = shape.encode(&hello).unwrap();
+            let suffix = [23, 3, 3, 0, 2, 42, 43];
+            expected.extend_from_slice(&suffix);
+            // Seven bytes forces partial underlying writes at every large boundary.
+            let (client, mut server) = tokio::io::duplex(7);
+            let receiver = tokio::spawn(async move {
+                let mut bytes = Vec::new();
+                server.read_to_end(&mut bytes).await.unwrap();
+                bytes
+            });
+            let mut writer = FragmentingStream::new(client, FragmentConfig::disabled());
+            writer.hello_shape = Some(shape);
+            writer.write_all(&hello).await.unwrap();
+            writer.flush().await.unwrap();
+            writer.write_all(&suffix).await.unwrap();
+            writer.shutdown().await.unwrap();
+            assert_eq!(receiver.await.unwrap(), expected);
+        }
+    }
+
+    #[tokio::test]
+    async fn reading_drains_an_accepted_hello_before_waiting_for_the_server() {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        let shape = crate::hello_shape::HelloShape::Compact;
+        let hello = client_hello("example.com");
+        let expected = shape.encode(&hello).unwrap();
+        let (client, mut server) = tokio::io::duplex(7);
+        let responder = tokio::spawn(async move {
+            let mut bytes = vec![0; expected.len()];
+            server.read_exact(&mut bytes).await.unwrap();
+            assert_eq!(bytes, expected);
+            server.write_all(b"reply").await.unwrap();
+        });
+        let mut writer = FragmentingStream::new(client, FragmentConfig::disabled());
+        writer.hello_shape = Some(shape);
+        writer.write_all(&hello).await.unwrap();
+        let mut reply = [0; 5];
+        tokio::time::timeout(Duration::from_secs(2), writer.read_exact(&mut reply))
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(&reply, b"reply");
+        responder.await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn both_record_shapes_complete_a_real_tls_handshake_and_exchange_data() {
+        use boring::{
+            pkey::PKey,
+            ssl::{SslAcceptor, SslConnector, SslMethod, SslVerifyMode},
+            x509::X509,
+        };
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        let pair = crate::account::generate_masque_keypair().unwrap();
+        let mut acceptor = SslAcceptor::mozilla_intermediate(SslMethod::tls()).unwrap();
+        acceptor
+            .set_certificate(&X509::from_pem(&pair.cert_pem).unwrap())
+            .unwrap();
+        acceptor
+            .set_private_key(&PKey::private_key_from_pem(&pair.key_pem).unwrap())
+            .unwrap();
+        let acceptor = std::sync::Arc::new(acceptor.build());
+        for shape in [
+            crate::hello_shape::HelloShape::Records,
+            crate::hello_shape::HelloShape::Compact,
+        ] {
+            let (client, server) = tokio::io::duplex(256);
+            let server_acceptor = acceptor.clone();
+            let server =
+                tokio::spawn(async move { tokio_boring::accept(&server_acceptor, server).await });
+            let mut connector = SslConnector::builder(SslMethod::tls()).unwrap();
+            // Local self-signed test peer only. Production pin verification
+            // continues to be installed by masque_h2::build_tls.
+            connector.set_verify(SslVerifyMode::NONE);
+            let mut shaped = FragmentingStream::new(client, FragmentConfig::disabled());
+            shaped.hello_shape = Some(shape);
+            let mut client = tokio::time::timeout(
+                Duration::from_secs(10),
+                tokio_boring::connect(connector.build().configure().unwrap(), "localhost", shaped),
+            )
+            .await
+            .unwrap()
+            .unwrap_or_else(|error| panic!("{shape:?} TLS handshake failed: {error}"));
+            let mut server = server.await.unwrap().unwrap();
+            client.write_all(b"tunnel data").await.unwrap();
+            let mut data = [0; 11];
+            server.read_exact(&mut data).await.unwrap();
+            assert_eq!(&data, b"tunnel data");
+        }
     }
 }
 
@@ -337,6 +559,9 @@ mod tests {
         };
         let mut stream = FragmentingStream::new(Vec::new(), cfg);
         let written = stream.write(&hello).await.unwrap();
-        assert!(start < written && written < end, "{start} < {written} < {end}");
+        assert!(
+            start < written && written < end,
+            "{start} < {written} < {end}"
+        );
     }
 }

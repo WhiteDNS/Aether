@@ -70,6 +70,15 @@ pub const MASQUE_SEEDS: &[&str] = &[
     "162.159.193.1",
 ];
 
+pub const MASQUE_VERIFIED_GATEWAYS: &[&str] = &[
+    "162.159.199.1",
+    "162.159.199.2",
+    "162.159.198.2",
+    "162.159.198.1",
+];
+
+pub const MASQUE_ALT_PORTS: &[u16] = &[1701, 8095, 500, 4500];
+
 pub const MASQUE_PORTS: &[u16] = &[443, 500, 1701, 4500, 4443, 8443, 8095];
 
 pub const MASQUE_CIDRS_V6: &[&str] = &[
@@ -167,6 +176,7 @@ pub enum ScanMode {
     Turbo,
     Balanced,
     Thorough,
+    Verified,
     Stealth,
     Ironclad,
 }
@@ -176,6 +186,7 @@ impl ScanMode {
         match s.trim().to_lowercase().as_str() {
             "turbo" | "fast" => ScanMode::Turbo,
             "thorough" | "deep" | "pro" => ScanMode::Thorough,
+            "verified" | "proven" => ScanMode::Verified,
             "stealth" | "quiet" => ScanMode::Stealth,
             "ironclad" | "real" | "verify" | "guaranteed" => ScanMode::Ironclad,
             _ => ScanMode::Balanced,
@@ -187,6 +198,7 @@ impl ScanMode {
             ScanMode::Turbo => "turbo",
             ScanMode::Balanced => "balanced",
             ScanMode::Thorough => "thorough",
+            ScanMode::Verified => "verified",
             ScanMode::Stealth => "stealth",
             ScanMode::Ironclad => "ironclad",
         }
@@ -202,7 +214,7 @@ impl ScanMode {
     }
 
     fn strategy(&self) -> Strategy {
-        match self {
+        let mut strategy = match self {
             ScanMode::Turbo => Strategy {
                 concurrency: 20,
                 per_probe_timeout: Duration::from_millis(6000),
@@ -243,6 +255,16 @@ impl ScanMode {
                 full_subnet: false,
                 sample_per_cidr: 64,
             },
+            ScanMode::Verified => Strategy {
+                concurrency: 16,
+                per_probe_timeout: Duration::from_millis(5000),
+                overall_deadline: Duration::from_secs(60),
+                quiet_after_first: Duration::from_secs(8),
+                target_successes: 4,
+                early_exit_first: false,
+                full_subnet: false,
+                sample_per_cidr: 48,
+            },
             ScanMode::Ironclad => Strategy {
                 concurrency: 4,
                 per_probe_timeout: Duration::from_millis(15000),
@@ -253,7 +275,15 @@ impl ScanMode {
                 full_subnet: false,
                 sample_per_cidr: 140,
             },
+        };
+        if matches!(self, ScanMode::Turbo)
+            && std::env::var("AETHER_CONNECT_FAST").as_deref() == Ok("1")
+        {
+            strategy.overall_deadline = Duration::from_secs(12);
+            strategy.per_probe_timeout = Duration::from_secs(3);
+            strategy.concurrency = 8;
         }
+        strategy
     }
 }
 
@@ -565,6 +595,9 @@ pub async fn scan_gateways(
 ) -> Result<Vec<ProbeResult>> {
     let mut st = mode.strategy();
     st.concurrency = crate::sysprofile::cap_concurrency(st.concurrency);
+    if st.quiet_after_first.is_zero() {
+        st.quiet_after_first = Duration::from_secs(8);
+    }
     let timeout = st.per_probe_timeout;
     let mut effective_ip = probe.ip;
     if probe.ip.want_v6() && !host_has_ipv6().await {
@@ -574,7 +607,7 @@ pub async fn scan_gateways(
             return Err(AetherError::NoCleanEndpoint);
         }
     }
-    let candidates = build_candidates(&st, &probe.ports, effective_ip);
+    let candidates = spread_seeds(build_candidates(&st, &probe.ports, effective_ip));
     let ironclad = mode == ScanMode::Ironclad;
     let stream = futures::stream::iter(
         candidates
@@ -584,7 +617,7 @@ pub async fn scan_gateways(
     .buffer_unordered(st.concurrency);
     tokio::pin!(stream);
 
-    let limit = limit.clamp(1, 16);
+    let limit = limit.clamp(1, 64);
     let deadline = Instant::now() + st.overall_deadline;
     let mut quiet_until: Option<Instant> = None;
     let mut results = Vec::new();
@@ -651,6 +684,7 @@ async fn verify_one(
             path: probe.path.clone(),
             cert_pem: probe.cert_pem.to_vec(),
             key_pem: probe.key_pem.to_vec(),
+            ech_config_list: probe.ech_config_list.as_ref().map(|a| a.to_vec()),
             noize: probe.noize.clone(),
             local_ipv4: probe.local_ipv4,
             local_ipv4_str: probe.local_ipv4.to_string(),
@@ -686,6 +720,7 @@ async fn verify_one(
                 .iter()
                 .map(|p| p.to_vec())
                 .collect(),
+            ech_config_list: probe.ech_config_list.as_ref().map(|a| a.to_vec()),
         };
         return match crate::masque_h2::verify_h2(&cfg, timeout).await {
             Ok(rtt) => Ok(ProbeResult { ip, port, rtt }),
@@ -715,6 +750,50 @@ async fn verify_one(
             log::debug!("probe {ip}:{port} -> {e}");
             Err(ProbeFailure::of(&e))
         }
+    }
+}
+
+/// One seed for every this many sampled addresses, when scanning.
+const SEED_SPACING: usize = 3;
+
+/// Spreads the fixed seed gateways through the sampled ones.
+///
+/// `build_candidates` puts the seeds first, which is right for connecting: they
+/// are the shortest path to a working tunnel. It is wrong for scanning. The seed
+/// list is eight addresses and a scan asks for eight results, so on any network
+/// where the seeds answer the list fills with them and no sampled address is
+/// ever reached — which is why every search depth returned the same handful.
+///
+/// The seeds are kept, just not allowed to monopolise the first wave.
+fn spread_seeds(candidates: Vec<(IpAddr, u16)>) -> Vec<(IpAddr, u16)> {
+    let seed_count = candidates
+        .iter()
+        .take_while(|(address, _)| is_seed(address))
+        .count();
+    if seed_count == 0 || candidates.len() <= seed_count {
+        return candidates;
+    }
+
+    let (seeds, sampled) = candidates.split_at(seed_count);
+    let mut seeds = seeds.iter();
+    let mut out = Vec::with_capacity(candidates.len());
+    for (index, entry) in sampled.iter().enumerate() {
+        if index % SEED_SPACING == SEED_SPACING - 1 {
+            if let Some(seed) = seeds.next() {
+                out.push(*seed);
+            }
+        }
+        out.push(*entry);
+    }
+    // Any seeds left over when the sampled list is short still get probed.
+    out.extend(seeds);
+    out
+}
+
+fn is_seed(address: &IpAddr) -> bool {
+    match address {
+        IpAddr::V4(v4) => MASQUE_SEEDS.iter().any(|seed| seed.parse() == Ok(*v4)),
+        IpAddr::V6(v6) => MASQUE_SEEDS_V6.iter().any(|seed| seed.parse() == Ok(*v6)),
     }
 }
 
@@ -925,6 +1004,54 @@ fn sample_cidr_v6(cidr: &str, n: usize, v4_cidrs: &[&str]) -> Vec<Ipv6Addr> {
 
 #[cfg(test)]
 mod tests {
+    fn v4(address: &str) -> IpAddr {
+        IpAddr::V4(address.parse().unwrap())
+    }
+
+    #[test]
+    fn scanning_does_not_let_the_seeds_fill_the_whole_result_list() {
+        // The eight seeds are as long as the result limit a scan asks for, so
+        // front-loaded they answer first, fill the list, and no sampled address
+        // is ever reached -- every search depth then returns the same handful.
+        let mut candidates: Vec<(IpAddr, u16)> =
+            MASQUE_SEEDS.iter().map(|s| (v4(s), 443)).collect();
+        for octet in 1..=40 {
+            candidates.push((v4(&format!("104.17.0.{octet}")), 443));
+        }
+
+        let spread = spread_seeds(candidates.clone());
+        assert_eq!(spread.len(), candidates.len(), "nothing may be dropped");
+
+        let first_eight = &spread[..8];
+        let seeds_up_front = first_eight.iter().filter(|(a, _)| is_seed(a)).count();
+        assert!(
+            seeds_up_front < MASQUE_SEEDS.len(),
+            "seeds still monopolise the first wave: {seeds_up_front} of 8",
+        );
+        assert!(
+            seeds_up_front > 0,
+            "seeds are known-good and must still be probed early"
+        );
+    }
+
+    #[test]
+    fn every_seed_is_still_probed() {
+        let mut candidates: Vec<(IpAddr, u16)> =
+            MASQUE_SEEDS.iter().map(|s| (v4(s), 443)).collect();
+        candidates.push((v4("104.17.0.1"), 443));
+        let spread = spread_seeds(candidates);
+        let seeds = spread.iter().filter(|(a, _)| is_seed(a)).count();
+        // A short sampled list must not strand the seeds that did not fit
+        // between its entries.
+        assert_eq!(seeds, MASQUE_SEEDS.len());
+    }
+
+    #[test]
+    fn a_list_with_no_sampled_addresses_is_returned_unchanged() {
+        let candidates: Vec<(IpAddr, u16)> = MASQUE_SEEDS.iter().map(|s| (v4(s), 443)).collect();
+        assert_eq!(spread_seeds(candidates.clone()), candidates);
+    }
+
     use super::*;
 
     #[test]
@@ -1331,5 +1458,43 @@ mod tests {
         for seed in MASQUE_SEEDS_V6 {
             assert!(seed.parse::<Ipv6Addr>().is_ok(), "{seed}");
         }
+    }
+
+    #[tokio::test]
+    async fn the_ironclad_check_offers_the_ech_key_of_its_scan() {
+        let _setting = crate::upstream::hold_setting().await;
+        // The check builds its TLS with the fingerprint the options give.
+        let _options = crate::tls::hold_options().await;
+        let identity = crate::account::handshake_identity();
+        let peer = tokio::net::UdpSocket::bind("127.0.0.1:0").await.unwrap();
+        let address = peer.local_addr().unwrap();
+        let probe = |ech: Option<Vec<u8>>| MasqueProbe {
+            sni: crate::consts::CONNECT_SNI.to_string(),
+            authority: quic::default_authority().to_string(),
+            path: quic::default_path().to_string(),
+            cert_pem: Arc::from(identity.cert_pem.clone()),
+            key_pem: Arc::from(identity.key_pem.clone()),
+            ech_config_list: ech.map(Arc::from),
+            noize: crate::noize::from_profile("off"),
+            ports: vec![address.port()],
+            ip: IpScan::V4,
+            local_ipv4: Ipv4Addr::new(172, 16, 0, 2),
+        };
+        let timeout = Duration::from_secs(5);
+
+        // Given a key BoringSSL offers nothing from (its one config is of another version), the
+        // check sends no ClientHello; the version bait may go out before it.
+        let unusable = probe(Some(vec![0, 6, 0xfe, 0x0c, 0, 2, 0, 0]));
+        let checked = verify_one(&unusable, address.ip(), address.port(), timeout, true).await;
+        assert!(checked.is_err());
+        assert!(!quic::hears_a_client_hello(&peer, Duration::from_millis(300)).await);
+
+        // Without a key, the same check does send one, with the server name in the clear.
+        let plain = probe(None);
+        let check = tokio::spawn(async move {
+            verify_one(&plain, address.ip(), address.port(), timeout, true).await
+        });
+        assert!(quic::hears_a_client_hello(&peer, Duration::from_secs(4)).await);
+        check.abort();
     }
 }

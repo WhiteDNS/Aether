@@ -50,6 +50,7 @@ Protocol:
                            of the way gool does, on the same carrier for both
                            hops (HTTP/3 in HTTP/3, or --h2 for HTTP/2 in HTTP/2)
   --protocol <name>        masque | wg | gool | mim
+  --wg-over-masque        WARP WireGuard inside MASQUE (H3, or --h2)
 
 WARP-in-WARP endpoints:
   Both hops are found by the scan unless you name them here. The port is
@@ -74,9 +75,13 @@ MASQUE-in-MASQUE endpoints:
   --mim-scan               find the outer hop by scanning, ignoring any endpoint
                            left in the environment
 
+Desktop contract (no network or identity provisioning):
+  --desktop-capabilities   version, revision, supported commands and features as JSON
+  --check-options          validate TLS/ECH/registration input as JSON
+
 Report gateways without connecting (prints one JSON object on stdout):
   --scan-only              rank reachable MASQUE gateways by round-trip time
-  --scan-limit <n>         how many to report (default 8, max 16)
+  --scan-limit <n>         how many to report (default 8, max 64)
   --test-endpoint <ip:port>
                            validate one gateway with a real authenticated handshake
 
@@ -108,6 +113,11 @@ MASQUE transport:
                            networks that block QUIC v1 but let QUIC v2 through)
   --h2-peer <ip:port>      override the peer used for the HTTP/2 transport
   --ech <auto|base64>      enable Encrypted Client Hello
+  --ech-dns <url>          resolver for ECH: udp://, tcp:// or https://
+  --ech-domain <name>      domain whose HTTPS record holds the ECH key
+  --tls-ciphers <list>     TLS 1.2 cipher list (BoringSSL names, ':' separated)
+  --disable-grease         omit GREASE from TLS handshakes
+  --enroll-address <host>  WARP registration address, with optional :port
   --no-data-check          skip the end-to-end data-plane validation
   --validate-secs <n>      seconds to wait for data-plane validation (default 10)
   --startup-secs <n>       total MASQUE startup deadline (default 30)
@@ -322,6 +332,7 @@ pub fn parse_and_apply() -> crate::error::Result<Parsed> {
 
 pub fn parse_args(args: Vec<String>) -> crate::error::Result<Parsed> {
     let mut i = 0;
+    let mut check_options = false;
 
     while i < args.len() {
         let arg = args[i].as_str();
@@ -336,6 +347,19 @@ pub fn parse_args(args: Vec<String>) -> crate::error::Result<Parsed> {
         }
 
         match arg {
+            "--desktop-capabilities" => {
+                println!(
+                    "{}",
+                    serde_json::json!({
+                        "schema": 1, "version": env!("CARGO_PKG_VERSION"),
+                        "revision": env!("AETHER_BUILD_REVISION"),
+                        "commands": ["scan-only", "scan-limit", "test-endpoint", "export-identity", "import-identity", "check-options"],
+                        "features": ["h2-ech", "h3-ech", "tls-ciphers", "tls-groups", "disable-grease", "enroll-address", "ech-dns", "ech-domain", "wg-over-masque", "verified", "scan-diversity", "history-8", "certificate-pinning"]
+                    })
+                );
+                return Ok(Parsed::Done);
+            }
+            "--check-options" => check_options = true,
             "-v" | "--version" => {
                 println!("aether {}", env!("CARGO_PKG_VERSION"));
                 return Ok(Parsed::Done);
@@ -381,6 +405,7 @@ pub fn parse_args(args: Vec<String>) -> crate::error::Result<Parsed> {
             "--wiw-scan" | "--gool-scan" => set("AETHER_WIW_PEERS", "auto"),
 
             "--masque" => set("AETHER_PROTOCOL", "masque"),
+            "--wg-over-masque" => set("AETHER_PROTOCOL", "wg-over-masque"),
             "--wg" | "--wireguard" | "--warp" => set("AETHER_PROTOCOL", "wg"),
             "--gool" | "--wiw" => set("AETHER_PROTOCOL", "gool"),
             "--mim" | "--masque-in-masque" => set("AETHER_PROTOCOL", "mim"),
@@ -404,6 +429,11 @@ pub fn parse_args(args: Vec<String>) -> crate::error::Result<Parsed> {
             "--no-quic-v2" => set("AETHER_QUIC_V2", "0"),
             "--h2-peer" => set("AETHER_MASQUE_H2_PEER", next_value!()),
             "--ech" => set("AETHER_ECH", next_value!()),
+            "--ech-dns" => set("AETHER_ECH_DNS", next_value!()),
+            "--ech-domain" => set("AETHER_ECH_DOMAIN", next_value!()),
+            "--tls-ciphers" => set("AETHER_TLS_CIPHERS", next_value!()),
+            "--disable-grease" => set("AETHER_DISABLE_GREASE", "1"),
+            "--enroll-address" => set("AETHER_ENROLL_ADDRESS", next_value!()),
             "--no-data-check" => {
                 set("AETHER_MASQUE_NO_DATA_CHECK", "1");
                 set("AETHER_WG_NO_DATA_CHECK", "1");
@@ -463,7 +493,42 @@ pub fn parse_args(args: Vec<String>) -> crate::error::Result<Parsed> {
         i += 1;
     }
 
+    if check_options {
+        let result = check_network_options();
+        match result {
+            Ok(()) => println!("{}", serde_json::json!({"ok": true})),
+            Err(error) => println!(
+                "{}",
+                serde_json::json!({"ok": false, "error": error.to_string()})
+            ),
+        }
+        return Ok(Parsed::Done);
+    }
     Ok(Parsed::Run)
+}
+
+/// Checks user input without opening sockets, looking up ECH or registering.
+pub fn check_network_options() -> crate::error::Result<()> {
+    crate::tls::check_tls_options()?;
+    crate::account::check_enroll_address()?;
+    let ech = env::var("AETHER_ECH").unwrap_or_default();
+    let ech = ech.trim();
+    if !ech.is_empty() && !ech.eq_ignore_ascii_case("off") {
+        if !ech.eq_ignore_ascii_case("auto") && !ech.eq_ignore_ascii_case("require") {
+            crate::tls::ensure_offerable(&crate::tls::decode_ech_config_list(ech)?)?;
+        }
+        if let Ok(resolver) = env::var("AETHER_ECH_DNS") {
+            crate::dns::EchDns::parse(&resolver).map_err(crate::error::AetherError::Ech)?;
+        }
+        if let Ok(domain) = env::var("AETHER_ECH_DOMAIN") {
+            if !domain.trim().is_empty() && !crate::dns::valid_domain(&domain) {
+                return Err(crate::error::AetherError::Ech(
+                    "--ech-domain: invalid domain".into(),
+                ));
+            }
+        }
+    }
+    Ok(())
 }
 
 fn set(key: &str, value: &str) {

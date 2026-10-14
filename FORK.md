@@ -4,8 +4,8 @@ This is a fork of [CluvexStudio/Aether](https://github.com/CluvexStudio/Aether),
 `v1.7.0` tag. Upstream history is preserved and `upstream` remains a remote, so everything here can
 be reviewed as a diff against the original.
 
-It exists so the WhiteAesther clients can offer an **endpoint picker**. Nothing about how Aether
-connects has been changed.
+It exists so the WhiteAesther clients can offer an **endpoint picker**. The desktop dispatcher and identity lifecycle remain this fork’s; network modules now carry
+Aether 2.3.0 and the Android integration fixes described in `DESKTOP_2_3.md`.
 
 ## What this fork adds
 
@@ -44,9 +44,9 @@ nothing for them.
 Taken ahead of a rebase onto 2.1.0: `dc797fc` (the HTTP/2 data-plane probe is resent), `2509da0`
 (WireGuard's firewall and gfw profiles), `5556752` (the ClientHello split inside the server name,
 and a split TLS 1.3 registration fingerprint), and `3788f4b` (WARP-in-WARP follows its inner
-tunnel's port). Psiphon and Tor inside the core, exit-country checks, statistics, the verified scan
-mode and the ring of remembered gateways are not carried: the WhiteAesther client runs Psiphon and
-Tor itself and keeps its own record of how an endpoint was proven. The socket mark (`--mark`) was
+tunnel's port). The 2.3 upgrade carries verified discovery and eight proven gateway records. Those records
+complement the desktop client’s per-network route memory. Embedded Psiphon/Tor service lifecycle
+and exit-country enforcement remain excluded; the client owns its existing carriers. The socket mark (`--mark`) was
 already here and stays.
 
 ## What it no longer needs to add
